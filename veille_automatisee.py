@@ -2,519 +2,674 @@
 # -*- coding: utf-8 -*-
 
 """
-Module d'intégration Google Sheet pour la veille automatisée des créatrices OnlyFans.
-Ce module contient les fonctions nécessaires pour mettre à jour le Google Sheet
-avec le contenu sélectionné pour chaque modèle.
-Il est conçu pour lire les credentials depuis les variables d'environnement
-SERVICE_ACCOUNT_JSON ou GOOGLE_OAUTH_TOKEN_JSON lorsqu'il est déployé.
+Script principal pour la veille automatisée des créatrices OnlyFans.
+Ce script intègre tous les modules développés et exécute le processus complet
+de scraping, sélection et mise à jour du Google Sheet.
 """
 
 import os
+import sys
 import json
 import time
 import logging
 import datetime
-from typing import Dict, List, Any, Optional
-import gspread
-from google.oauth2.service_account import Credentials
-from google.oauth2.credentials import Credentials as UserCredentials # Renommer pour éviter conflit
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import argparse
+import sqlite3
+import schedule
+import traceback
+import random
+from typing import Dict, List, Any
+
+# Importer les modules développés
+from instagram_scraper import InstagramScraper, extract_instagram_content
+from twitter_scraper import TwitterScraper, extract_twitter_content
+from threads_scraper import ThreadsScraper, extract_threads_content
+from tiktok_scraper import TikTokScraper, extract_tiktok_content, get_tiktok_trending_hashtags, get_tiktok_trending_sounds
+from content_selector import ContentSelector, select_content_for_all_models, process_scraped_content, process_trending_content
+from google_sheet_integration import GoogleSheetIntegration
 
 # Configuration du logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG,  # Changé de INFO à DEBUG pour plus de détails
+    format=\'%(asctime)s - %(name)s - %(levelname)s - %(message)s\',
     handlers=[
-        logging.FileHandler("google_sheet_integration.log"),
+        logging.FileHandler("veille_automatisee.log"),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger("google_sheet_integration")
+logger = logging.getLogger("veille_automatisee")
 
-# Constantes pour l'authentification Google
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'
+# Définition des modèles
+MODELS = [
+    {
+        "name": "Talia",
+        "instagram": "talia_srz",
+        "twitter": "talia_srz",
+        "threads": "talia_srz",
+        "tiktok": None,
+        "style": "Coquin soft, caption + musique uniquement",
+        "avg_views": 4000,
+        "preferences": {
+            "prefers_speaking": False,
+            "prefers_captions": True,
+            "prefers_music": True
+        },
+        "similar_accounts": {
+            "instagram": ["annatomex", "jadetora_", "gabigarciareels", "ludivine_dstr", "alexxa.hln"]
+        }
+    },
+    {
+        "name": "Léa",
+        "instagram": "lea_vlmtt",
+        "twitter": "lea_vlmt",
+        "threads": "lea_vlmtt",
+        "tiktok": None,
+        "style": "Coquin souriant, caption + musique uniquement",
+        "avg_views": 3000,
+        "preferences": {
+            "prefers_speaking": False,
+            "prefers_captions": True,
+            "prefers_music": True
+        },
+        "similar_accounts": {
+            "instagram": ["vanessaparadiise", "miadacostaaa", "lolasoliia", "itsaria_06", "leeaacrl", "lestia_fyw", "nayia_roy", "nayiaroyprivate"]
+        }
+    },
+    {
+        "name": "Lizz",
+        "instagram": "lizzrmo",
+        "twitter": None,
+        "threads": "lizz.rmo",
+        "tiktok": None,
+        "style": "Coquin parlé, facecam avec sous-titres texte",
+        "avg_views": 3500,
+        "preferences": {
+            "prefers_speaking": True,
+            "prefers_captions": True,
+            "prefers_music": False
+        },
+        "similar_accounts": {
+            "instagram": ["laly_chauvette", "itsjustdidine", "iamlupix", "solenerlt2", "laeyanah", "maylisnbd", "mya_bellony", "kathelyn_klf", "emmaxvibing", "mimibloom_", "linamycrush"]
+        }
+    }
 ]
-SERVICE_ACCOUNT_FILE = 'service_account.json' # Utilisé comme fallback local
-TOKEN_FILE = 'token.json' # Utilisé comme fallback local
 
-class GoogleSheetIntegration:
-    """Classe pour l'intégration avec Google Sheet."""
+# ID du Google Sheet
+SPREADSHEET_ID = "1KhTXJu9BlIfi8D99C_lvxdC77D2X9pOy5JGiKmoLt-k"
+
+# Configuration des quotas
+DAILY_QUOTA = {
+    "instagram": 50,
+    "twitter": 50,
+    "threads": 30,
+    "tiktok": 30
+}
+
+# Chemin de la base de données
+DB_PATH = "content_database.db"
+
+def check_dependencies():
+    """Vérifie que toutes les dépendances sont installées."""
+    try:
+        import selenium
+        import bs4
+        import gspread
+        import google.oauth2
+        import fake_useragent
+        import schedule
+        import requests
+        import webdriver_manager
+        logger.info("Toutes les dépendances sont installées.")
+        return True
+    except ImportError as e:
+        logger.error(f"Dépendance manquante: {str(e)}")
+        return False
+
+def install_dependencies():
+    """Installe les dépendances nécessaires."""
+    import subprocess
     
-    def __init__(self, spreadsheet_id: str):
-        """
-        Initialise l'intégration Google Sheet.
-        
-        Args:
-            spreadsheet_id (str): ID du Google Sheet à mettre à jour
-        """
-        self.spreadsheet_id = spreadsheet_id
-        self.client = None
-        self.spreadsheet = None
+    dependencies = [
+        "selenium",
+        "beautifulsoup4",
+        "gspread",
+        "google-auth",
+        "google-auth-oauthlib",
+        "google-auth-httplib2",
+        "google-api-python-client",
+        "fake-useragent",
+        "schedule",
+        "requests",
+        "webdriver-manager",
+        "chromedriver-autoinstaller"
+    ]
     
-    def authenticate(self):
-        """
-        Authentifie auprès de l'API Google Sheets en utilisant un compte de service.
-        Priorise la variable d'environnement SERVICE_ACCOUNT_JSON.
-        
-        Returns:
-            bool: True si l'authentification a réussi, False sinon
-        """
-        creds = None
+    logger.info("Installation des dépendances...")
+    
+    for dep in dependencies:
         try:
-            service_account_json_str = os.environ.get('SERVICE_ACCOUNT_JSON')
-            if service_account_json_str:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", dep])
+            logger.info(f"Dépendance installée: {dep}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Erreur lors de l\"installation de {dep}: {str(e)}")
+            return False
+    
+    logger.info("Toutes les dépendances ont été installées.")
+    return True
+
+def init_database():
+    """Initialise la base de données SQLite."""
+    try:
+        # Créer une instance du sélecteur de contenu pour initialiser la structure de la base de données
+        selector = ContentSelector()
+        selector.close()
+        
+        logger.info("Base de données initialisée avec succès.")
+        return True
+    except Exception as e:
+        logger.error(f"Erreur lors de l\"initialisation de la base de données: {str(e)}")
+        return False
+
+def setup_environment():
+    """Configure l\"environnement d\"exécution."""
+    # Vérifier et installer les dépendances si nécessaire
+    if not check_dependencies():
+        if not install_dependencies():
+            logger.error("Impossible d\"installer toutes les dépendances. Arrêt du programme.")
+            return False
+    
+    # Initialiser la base de données SQLite
+    if not init_database():
+        logger.error("Impossible d\"initialiser la base de données. Arrêt du programme.")
+        return False
+    
+    # Installer ChromeDriver automatiquement
+    try:
+        import chromedriver_autoinstaller
+        chromedriver_autoinstaller.install()
+        logger.info("ChromeDriver installé automatiquement.")
+    except Exception as e:
+        logger.warning(f"Impossible d\"installer ChromeDriver automatiquement: {str(e)}")
+        logger.warning("Vous devrez peut-être installer ChromeDriver manuellement.")
+    
+    logger.info("Environnement configuré avec succès.")
+    return True
+
+def update_model_preferences():
+    """Met à jour les préférences des modèles dans la base de données."""
+    try:
+        selector = ContentSelector()
+        
+        for model in MODELS:
+            model_name = model["name"]
+            preferences = model.get("preferences", {})
+            
+            # Construire les préférences
+            prefers_speaking = preferences.get("prefers_speaking", False)
+            prefers_captions = preferences.get("prefers_captions", False)
+            prefers_music = preferences.get("prefers_music", False)
+            
+            # Mettre à jour les préférences dans la base de données
+            selector.cursor.execute(\'\'\'
+            UPDATE model_preferences SET 
+            prefers_speaking = ?,
+            prefers_captions = ?,
+            prefers_music = ?
+            WHERE model_name = ?
+            \'\'\', (
+                1 if prefers_speaking else 0,
+                1 if prefers_captions else 0,
+                1 if prefers_music else 0,
+                model_name
+            ))
+        
+        selector.conn.commit()
+        selector.close()
+        
+        logger.info("Préférences des modèles mises à jour avec succès.")
+        return True
+    except Exception as e:
+        logger.error(f"Erreur lors de la mise à jour des préférences des modèles: {str(e)}")
+        return False
+
+def update_model_stats():
+    """Met à jour les statistiques des modèles dans la base de données."""
+    try:
+        selector = ContentSelector()
+        
+        for model in MODELS:
+            model_name = model["name"]
+            avg_views = model.get("avg_views", 0)
+            
+            # Mettre à jour les statistiques dans la base de données
+            selector.cursor.execute(\'\'\'
+            UPDATE model_stats SET 
+            avg_reel_views = ?
+            WHERE model_name = ?
+            \'\'\', (avg_views, model_name))
+        
+        selector.conn.commit()
+        selector.close()
+        
+        logger.info("Statistiques des modèles mises à jour avec succès.")
+        return True
+    except Exception as e:
+        logger.error(f"Erreur lors de la mise à jour des statistiques des modèles: {str(e)}")
+        return False
+
+def generate_test_data():
+    """Génère des données de test et les insère dans la base de données."""
+    logger.info("Génération des données de test...")
+    selector = ContentSelector()
+    now = datetime.datetime.now().isoformat()
+    
+    test_content = []
+    for model in MODELS:
+        model_name = model["name"]
+        
+        # Générer 2 photos
+        for i in range(2):
+            test_content.append({
+                "model_name": model_name,
+                "link": f"https://test.com/{model_name.lower()}/photo/{random.randint(1000, 9999)}",
+                "content_type": "photo",
+                "platform": random.choice(["instagram", "twitter", "threads"]),
+                "extraction_date": now,
+                "performance_metric": random.uniform(500, 5000),
+                "engagement_score": random.uniform(1, 10),
+                "is_speaking": False,
+                "has_captions": random.choice([True, False]),
+                "has_music": random.choice([True, False]),
+                "metadata": {"test_data": True, "photo_index": i + 1}
+            })
+            
+        # Générer 1 vidéo
+        test_content.append({
+            "model_name": model_name,
+            "link": f"https://test.com/{model_name.lower()}/video/{random.randint(1000, 9999)}",
+            "content_type": "video",
+            "platform": random.choice(["twitter", "threads", "tiktok"]),
+            "extraction_date": now,
+            "performance_metric": random.uniform(1000, 10000),
+            "engagement_score": random.uniform(1, 10),
+            "is_speaking": model["preferences"].get("prefers_speaking", False),
+            "has_captions": model["preferences"].get("prefers_captions", False),
+            "has_music": model["preferences"].get("prefers_music", False),
+            "metadata": {"test_data": True}
+        })
+        
+        # Générer 1 reel
+        test_content.append({
+            "model_name": model_name,
+            "link": f"https://test.com/{model_name.lower()}/reel/{random.randint(1000, 9999)}",
+            "content_type": "reel",
+            "platform": "instagram",
+            "extraction_date": now,
+            "performance_metric": random.uniform(2000, 20000),
+            "engagement_score": random.uniform(1, 10),
+            "is_speaking": model["preferences"].get("prefers_speaking", False),
+            "has_captions": model["preferences"].get("prefers_captions", False),
+            "has_music": model["preferences"].get("prefers_music", False),
+            "metadata": {"test_data": True}
+        })
+
+    # Insérer les données de test dans la base de données
+    count = 0
+    for content_item in test_content:
+        if selector.store_content(content_item):
+            count += 1
+            
+    selector.close()
+    logger.info(f"{count} éléments de test générés et stockés dans la base de données.")
+    return count > 0
+
+def run_instagram_scraping(model, days_limit=14, max_posts=20):
+    """
+    Exécute le scraping Instagram pour un modèle donné.
+    
+    Args:
+        model (dict): Informations du modèle
+        days_limit (int): Limite en jours pour le contenu récent
+        max_posts (int): Nombre maximum de posts à extraire
+        
+    Returns:
+        dict: Résultats du scraping
+    """
+    if "instagram" not in model or not model["instagram"]:
+        logger.warning(f"Pas de compte Instagram défini pour {model[\'name\']}")
+        return None
+    
+    username = model["instagram"]
+    logger.info(f"Scraping Instagram pour {model[\'name\']} (@{username})...")
+    
+    try:
+        # Extraire le contenu Instagram du compte principal
+        content = extract_instagram_content(username, days_limit, max_posts)
+        
+        if not content:
+            logger.warning(f"Aucun contenu Instagram trouvé pour {model[\'name\']} (@{username})")
+            content = []
+        
+        # Log du nombre de posts bruts collectés
+        logger.debug(f"Instagram: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        
+        # Préparer les résultats
+        results = {
+            "platform": "instagram",
+            "username": username,
+            "posts": content
+        }
+        
+        # Traiter le contenu extrait
+        model_names = [model["name"]]
+        count = process_scraped_content(results, model_names)
+        
+        logger.info(f"Scraping Instagram terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        
+        # Scraper les comptes similaires
+        similar_accounts = model.get("similar_accounts", {}).get("instagram", [])
+        
+        if similar_accounts:
+            logger.info(f"Scraping des comptes Instagram similaires pour {model[\'name\']}...")
+            
+            for similar_account in similar_accounts:
                 try:
-                    logger.info("Utilisation des credentials du compte de service depuis la variable d'environnement SERVICE_ACCOUNT_JSON")
-                    service_account_info = json.loads(service_account_json_str)
-                    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-                except json.JSONDecodeError:
-                    logger.error("Erreur lors du décodage JSON de la variable d'environnement SERVICE_ACCOUNT_JSON")
-                    return False
+                    logger.info(f"Scraping Instagram pour compte similaire: @{similar_account}")
+                    
+                    # Extraire le contenu Instagram du compte similaire
+                    similar_content = extract_instagram_content(similar_account, days_limit, max_posts)
+                    
+                    if not similar_content:
+                        logger.warning(f"Aucun contenu Instagram trouvé pour le compte similaire @{similar_account}")
+                        continue
+                    
+                    # Log du nombre de posts bruts collectés pour le compte similaire
+                    logger.debug(f"Instagram (similaire): {len(similar_content)} posts bruts collectés pour @{similar_account}")
+                    
+                    # Préparer les résultats
+                    similar_results = {
+                        "platform": "instagram",
+                        "username": similar_account,
+                        "posts": similar_content
+                    }
+                    
+                    # Traiter le contenu extrait
+                    similar_count = process_scraped_content(similar_results, model_names)
+                    
+                    logger.info(f"Scraping Instagram terminé pour compte similaire @{similar_account}: {similar_count} éléments stockés")
+                    
+                    # Ajouter le contenu au résultat global
+                    if "posts" in results:
+                        results["posts"].extend(similar_content)
+                    else:
+                        results["posts"] = similar_content
+                        
                 except Exception as e:
-                    logger.error(f"Erreur lors de l'utilisation des credentials depuis SERVICE_ACCOUNT_JSON: {str(e)}")
-                    return False
-            elif os.path.exists(SERVICE_ACCOUNT_FILE):
-                logger.warning(f"Variable d'environnement SERVICE_ACCOUNT_JSON non trouvée. Tentative d'utilisation du fichier local: {SERVICE_ACCOUNT_FILE}")
-                creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-            else:
-                logger.error(f"Credentials du compte de service non trouvés (ni variable d'environnement SERVICE_ACCOUNT_JSON, ni fichier {SERVICE_ACCOUNT_FILE})")
-                return False
-
-            # Créer le client gspread
-            self.client = gspread.authorize(creds)
-            
-            # Ouvrir le Google Sheet
-            self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
-            
-            logger.info(f"Authentification (compte de service) réussie pour le Google Sheet: {self.spreadsheet.title}")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors de l'authentification (compte de service): {str(e)}")
-            return False
-    
-    def authenticate_with_oauth(self):
-        """
-        Authentifie auprès de l'API Google Sheets en utilisant OAuth2.
-        Priorise la variable d'environnement GOOGLE_OAUTH_TOKEN_JSON.
-        
-        Returns:
-            bool: True si l'authentification a réussi, False sinon
-        """
-        creds = None
-        try:
-            oauth_token_json_str = os.environ.get('GOOGLE_OAUTH_TOKEN_JSON')
-            if oauth_token_json_str:
-                try:
-                    logger.info("Utilisation des credentials OAuth2 depuis la variable d'environnement GOOGLE_OAUTH_TOKEN_JSON")
-                    token_data = json.loads(oauth_token_json_str)
-                    # Note: Utiliser google.oauth2.credentials.Credentials ici
-                    creds = UserCredentials.from_authorized_user_info(token_data, SCOPES)
-                except json.JSONDecodeError:
-                    logger.error("Erreur lors du décodage JSON de la variable d'environnement GOOGLE_OAUTH_TOKEN_JSON")
-                    return False
-                except Exception as e:
-                    logger.error(f"Erreur lors de l'utilisation des credentials depuis GOOGLE_OAUTH_TOKEN_JSON: {str(e)}")
-                    return False
-            elif os.path.exists(TOKEN_FILE):
-                logger.warning(f"Variable d'environnement GOOGLE_OAUTH_TOKEN_JSON non trouvée. Tentative d'utilisation du fichier local: {TOKEN_FILE}")
-                with open(TOKEN_FILE, 'r') as f:
-                    token_data = json.load(f)
-                creds = UserCredentials.from_authorized_user_info(token_data, SCOPES)
-            else:
-                logger.error(f"Credentials OAuth2 non trouvés (ni variable d'environnement GOOGLE_OAUTH_TOKEN_JSON, ni fichier {TOKEN_FILE})")
-                return False
-
-            # Créer le client gspread
-            self.client = gspread.authorize(creds)
-            
-            # Ouvrir le Google Sheet
-            self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
-            
-            logger.info(f"Authentification OAuth2 réussie pour le Google Sheet: {self.spreadsheet.title}")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors de l'authentification OAuth2: {str(e)}")
-            return False
-    
-    def get_or_create_worksheet(self, model_name: str) -> Optional[gspread.Worksheet]:
-        """
-        Récupère ou crée une feuille de calcul pour un modèle donné.
-        
-        Args:
-            model_name (str): Nom du modèle
-            
-        Returns:
-            gspread.Worksheet: Feuille de calcul pour le modèle, ou None en cas d'erreur
-        """
-        if not self.spreadsheet:
-            logger.error("Spreadsheet non initialisé. Veuillez vous authentifier d'abord.")
-            return None
-        
-        try:
-            # Essayer de récupérer la feuille existante
-            worksheet = self.spreadsheet.worksheet(model_name)
-            logger.info(f"Feuille existante trouvée pour {model_name}")
-            return worksheet
-        except gspread.exceptions.WorksheetNotFound:
-            # Créer une nouvelle feuille si elle n'existe pas
-            try:
-                worksheet = self.spreadsheet.add_worksheet(title=model_name, rows=1000, cols=20)
-                
-                # Configurer les en-têtes
-                headers = [
-                    "Date", "Réseau Social", "Lien Photo 1", "Lien Photo 2", 
-                    "Lien Vidéo", "Lien Reel Performant"
-                ]
-                worksheet.update('A1:F1', [headers])
-                
-                # Formater les en-têtes (gras, centré, etc.)
-                worksheet.format('A1:F1', {
-                    'textFormat': {'bold': True},
-                    'horizontalAlignment': 'CENTER',
-                    'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
-                })
-                
-                # Ajuster la largeur des colonnes
-                worksheet.columns_auto_resize(0, 6)
-                
-                logger.info(f"Nouvelle feuille créée pour {model_name}")
-                return worksheet
-            except Exception as e:
-                logger.error(f"Erreur lors de la création de la feuille pour {model_name}: {str(e)}")
-                return None
-    
-    def add_daily_content(self, model_name: str, content: Dict[str, Any]) -> bool:
-        """
-        Ajoute le contenu quotidien pour un modèle dans sa feuille de calcul.
-        
-        Args:
-            model_name (str): Nom du modèle
-            content (dict): Contenu à ajouter (date, liens photos, vidéo, réel)
-            
-        Returns:
-            bool: True si l'ajout a réussi, False sinon
-        """
-        worksheet = self.get_or_create_worksheet(model_name)
-        if not worksheet:
-            return False
-        
-        try:
-            # Préparer les données à ajouter
-            date = content.get("date", datetime.datetime.now().strftime("%Y-%m-%d"))
-            
-            # Déterminer le réseau social pour chaque contenu
-            photo_sources = []
-            for link in content.get("photo_links", []):
-                if not link: continue # Ignorer les liens vides
-                if "instagram.com" in link:
-                    photo_sources.append("Instagram")
-                elif "twitter.com" in link or "x.com" in link:
-                    photo_sources.append("Twitter")
-                elif "threads.net" in link:
-                    photo_sources.append("Threads")
-                elif "test.com" in link: # Gérer les liens de test
-                     photo_sources.append("Test")
-                else:
-                    photo_sources.append("Autre")
-            
-            video_source = ""
-            video_link = content.get("video_link")
-            if video_link:
-                if "twitter.com" in video_link or "x.com" in video_link:
-                    video_source = "Twitter"
-                elif "threads.net" in video_link:
-                    video_source = "Threads"
-                elif "test.com" in video_link:
-                    video_source = "Test"
-            
-            reel_source = ""
-            reel_link = content.get("reel_link")
-            if reel_link:
-                 if "instagram.com" in reel_link:
-                    reel_source = "Instagram"
-                 elif "test.com" in reel_link:
-                    reel_source = "Test"
-            
-            # Déterminer le réseau social principal pour cette entrée
-            all_sources = photo_sources + ([video_source] if video_source else []) + ([reel_source] if reel_source else [])
-            if all_sources:
-                # Prioriser les vrais réseaux sur 'Test' ou 'Autre'
-                real_sources = [s for s in all_sources if s not in ["Test", "Autre"]]
-                if real_sources:
-                     main_source = max(set(real_sources), key=real_sources.count)
-                elif "Test" in all_sources:
-                     main_source = "Test"
-                else:
-                     main_source = "Autre"
-            else:
-                main_source = "N/A"
-            
-            # Préparer la ligne à ajouter
-            row_data = [
-                date,
-                main_source,
-                content.get("photo_links", [""])[0] if len(content.get("photo_links", [])) > 0 else "",
-                content.get("photo_links", ["", ""])[1] if len(content.get("photo_links", [])) > 1 else "",
-                video_link or "",
-                reel_link or ""
-            ]
-            
-            # Trouver la première ligne vide
-            values = worksheet.get_all_values()
-            next_row = len(values) + 1
-            
-            # Ajouter la ligne
-            worksheet.update(f'A{next_row}:F{next_row}', [row_data])
-            
-            # Formater les liens en bleu et soulignés
-            for col_index, link in enumerate(row_data[2:], start=2): # Colonnes C à F (index 2 à 5)
-                if link:  # Si la cellule contient un lien
-                    cell = gspread.utils.rowcol_to_a1(next_row, col_index + 1)  # +1 car gspread est 1-indexé
-                    worksheet.format(cell, {
-                        'textFormat': {'foregroundColor': {'red': 0.0, 'green': 0.0, 'blue': 0.8}},
-                        # 'textDecoration': {'underline': True} # Décoration retirée pour lisibilité
-                    })
-            
-            logger.info(f"Contenu quotidien ajouté pour {model_name}")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors de l'ajout du contenu pour {model_name}: {str(e)}")
-            logger.error(traceback.format_exc()) # Ajouter traceback pour plus de détails
-            return False
-    
-    def update_all_models(self, content_data: Dict[str, Dict[str, Any]]) -> Dict[str, bool]:
-        """
-        Met à jour le Google Sheet pour tous les modèles.
-        
-        Args:
-            content_data (dict): Dictionnaire contenant le contenu pour chaque modèle
-            
-        Returns:
-            dict: Résultats de la mise à jour pour chaque modèle
-        """
-        results = {}
-        
-        for model_name, content in content_data.items():
-            success = self.add_daily_content(model_name, content)
-            results[model_name] = success
-            
-            # Ajouter un délai pour éviter les limitations de l'API
-            time.sleep(1.5) # Augmenter légèrement le délai
+                    logger.error(f"Erreur lors du scraping Instagram pour compte similaire @{similar_account}: {str(e)}")
+                    logger.error(traceback.format_exc())
         
         return results
-
-# Les fonctions suivantes ne sont plus nécessaires si les credentials sont gérés par variables d'environnement
-# def create_service_account_file(credentials_json: str) -> bool:
-#     """
-#     Crée le fichier de compte de service à partir d'une chaîne JSON.
-#     (Déprécié en faveur des variables d'environnement)
-#     """
-#     # ... (code original)
-
-# def create_oauth_token_file(token_json: str) -> bool:
-#     """
-#     Crée le fichier de token OAuth2 à partir d'une chaîne JSON.
-#     (Déprécié en faveur des variables d'environnement)
-#     """
-#     # ... (code original)
-
-def generate_oauth_url() -> str:
-    """
-    Génère l'URL pour l'authentification OAuth2 (pour configuration initiale).
-    Nécessite un fichier client_secrets.json local (NE PAS COMMITTER).
-    
-    Returns:
-        str: URL d'authentification OAuth2, ou message d'erreur
-    """
-    try:
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        
-        CLIENT_SECRETS_FILE = 'client_secrets.json'
-        
-        if not os.path.exists(CLIENT_SECRETS_FILE):
-             logger.error(f"Fichier {CLIENT_SECRETS_FILE} non trouvé. Nécessaire pour générer l'URL OAuth.")
-             # Essayer de lire depuis l'environnement si disponible
-             client_secrets_json_str = os.environ.get('CLIENT_SECRETS_JSON')
-             if client_secrets_json_str:
-                 logger.info("Utilisation de CLIENT_SECRETS_JSON depuis l'environnement pour générer l'URL")
-                 client_config = json.loads(client_secrets_json_str)
-                 flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-             else:
-                 return "Erreur: Fichier client_secrets.json non trouvé et variable d'environnement CLIENT_SECRETS_JSON non définie."
-        else:
-            # Créer le flow OAuth2 depuis le fichier local
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CLIENT_SECRETS_FILE,
-                scopes=SCOPES
-            )
-        
-        # Utiliser la redirection localhost pour obtenir le code plus facilement
-        flow.redirect_uri = 'http://localhost:8080/' 
-        
-        # Générer l'URL d'authentification
-        auth_url, _ = flow.authorization_url(
-            access_type='offline',
-            prompt='consent', # Forcer l'affichage du consentement pour obtenir un refresh_token
-            include_granted_scopes='true'
-        )
-        
-        logger.info("URL d'authentification OAuth générée. Veuillez l'ouvrir dans votre navigateur.")
-        logger.info("Après autorisation, vous serez redirigé vers localhost. Copiez l'URL complète de redirection.")
-        return auth_url
     except Exception as e:
-        logger.error(f"Erreur lors de la génération de l'URL OAuth: {str(e)}")
-        return f"Erreur: {str(e)}"
-
-def exchange_auth_code_for_token(auth_code: str) -> Optional[str]:
-    """
-    Échange le code d'autorisation OAuth contre un token (incluant refresh_token).
-    Nécessite un fichier client_secrets.json local ou la variable d'env CLIENT_SECRETS_JSON.
-
-    Args:
-        auth_code (str): Le code d'autorisation obtenu après redirection.
-
-    Returns:
-        str: Le contenu JSON du token, prêt à être mis dans la variable d'env GOOGLE_OAUTH_TOKEN_JSON.
-             None en cas d'erreur.
-    """
-    try:
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        
-        CLIENT_SECRETS_FILE = 'client_secrets.json'
-        
-        if not os.path.exists(CLIENT_SECRETS_FILE):
-             logger.error(f"Fichier {CLIENT_SECRETS_FILE} non trouvé. Nécessaire pour échanger le code.")
-             client_secrets_json_str = os.environ.get('CLIENT_SECRETS_JSON')
-             if client_secrets_json_str:
-                 logger.info("Utilisation de CLIENT_SECRETS_JSON depuis l'environnement pour échanger le code")
-                 client_config = json.loads(client_secrets_json_str)
-                 flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-             else:
-                 logger.error("Fichier client_secrets.json non trouvé et variable d'environnement CLIENT_SECRETS_JSON non définie.")
-                 return None
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
-        
-        flow.redirect_uri = 'http://localhost:8080/' # Doit correspondre à la génération de l'URL
-
-        # Échanger le code contre des credentials
-        flow.fetch_token(code=auth_code)
-        
-        # Obtenir les credentials (qui incluent le refresh_token si access_type='offline' et prompt='consent')
-        credentials = flow.credentials
-        
-        # Convertir les credentials en JSON
-        token_data = {
-            'token': credentials.token,
-            'refresh_token': credentials.refresh_token,
-            'token_uri': credentials.token_uri,
-            'client_id': credentials.client_id,
-            'client_secret': credentials.client_secret,
-            'scopes': credentials.scopes
-        }
-        token_json = json.dumps(token_data)
-        
-        logger.info("Token OAuth obtenu avec succès (incluant refresh_token si possible).")
-        logger.info("Copiez le JSON suivant dans la variable d'environnement GOOGLE_OAUTH_TOKEN_JSON de Railway:")
-        print("---- COPIEZ CE JSON ----")
-        print(token_json)
-        print("-------------------------")
-        
-        # Sauvegarder aussi localement pour référence (optionnel)
-        # with open(TOKEN_FILE, 'w') as token_f:
-        #     token_f.write(token_json)
-        # logger.info(f"Token également sauvegardé localement dans {TOKEN_FILE}")
-            
-        return token_json
-
-    except Exception as e:
-        logger.error(f"Erreur lors de l'échange du code d'autorisation: {str(e)}")
+        logger.error(f"Erreur lors du scraping Instagram pour {model[\'name\']}: {str(e)}")
         logger.error(traceback.format_exc())
         return None
 
-def main():
-    """Fonction principale pour tester l'intégration Google Sheet."""
-    # ID du Google Sheet (à remplacer par l'ID réel si différent)
-    spreadsheet_id = "1KhTXJu9BlIfi8D99C_lvxdC77D2X9pOy5JGiKmoLt-k"
+def run_twitter_scraping(model, days_limit=14, max_posts=20):
+    """
+    Exécute le scraping Twitter pour un modèle donné.
     
-    # Créer l'intégration
-    integration = GoogleSheetIntegration(spreadsheet_id)
-    
-    # --- Choisir la méthode d'authentification --- 
-    # 1. Compte de service (recommandé pour les serveurs comme Railway)
-    authenticated = integration.authenticate()
-    
-    # 2. OAuth2 (si compte de service non possible, nécessite configuration initiale)
-    # authenticated = integration.authenticate_with_oauth()
-    # ---------------------------------------------
-    
-    if not authenticated:
-        logger.error("Échec de l'authentification. Vérifiez les credentials (variables d'environnement ou fichiers locaux).")
+    Args:
+        model (dict): Informations du modèle
+        days_limit (int): Limite en jours pour le contenu récent
+        max_posts (int): Nombre maximum de posts à extraire
         
-        # Aide pour configurer OAuth2 si nécessaire
-        logger.info("Si vous utilisez OAuth2 et que c'est la première fois, générez l'URL d'authentification.")
-        # print("URL OAuth: ", generate_oauth_url())
-        # auth_code = input("Entrez le code d'autorisation obtenu après redirection: ")
-        # exchange_auth_code_for_token(auth_code)
+    Returns:
+        dict: Résultats du scraping
+    """
+    if "twitter" not in model or not model["twitter"]:
+        logger.warning(f"Pas de compte Twitter défini pour {model[\'name\']}")
+        return None
+    
+    username = model["twitter"]
+    logger.info(f"Scraping Twitter pour {model[\'name\']} (@{username})...")
+    
+    try:
+        # Extraire le contenu Twitter
+        content = extract_twitter_content(username, days_limit, max_posts)
+        
+        if not content:
+            logger.warning(f"Aucun contenu Twitter trouvé pour {model[\'name\']} (@{username})")
+            content = [] # Initialiser comme liste vide si aucun contenu
+        
+        # Log du nombre de posts bruts collectés
+        logger.debug(f"Twitter: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        
+        # Préparer les résultats
+        results = {
+            "platform": "twitter",
+            "username": username,
+            "posts": content
+        }
+        
+        # Traiter le contenu extrait
+        model_names = [model["name"]]
+        count = process_scraped_content(results, model_names)
+        
+        logger.info(f"Scraping Twitter terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        
+        # Scraper les comptes similaires (si applicable)
+        # Note: La logique pour les comptes similaires Twitter n\"est pas implémentée ici
+        
+        return results
+    except Exception as e:
+        logger.error(f"Erreur lors du scraping Twitter pour {model[\'name\']}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
+
+def run_threads_scraping(model, days_limit=14, max_posts=20):
+    """
+    Exécute le scraping Threads pour un modèle donné.
+    
+    Args:
+        model (dict): Informations du modèle
+        days_limit (int): Limite en jours pour le contenu récent
+        max_posts (int): Nombre maximum de posts à extraire
+        
+    Returns:
+        dict: Résultats du scraping
+    """
+    if "threads" not in model or not model["threads"]:
+        logger.warning(f"Pas de compte Threads défini pour {model[\'name\']}")
+        return None
+    
+    username = model["threads"]
+    logger.info(f"Scraping Threads pour {model[\'name\']} (@{username})...")
+    
+    try:
+        # Extraire le contenu Threads
+        content = extract_threads_content(username, days_limit, max_posts)
+        
+        if not content:
+            logger.warning(f"Aucun contenu Threads trouvé pour {model[\'name\']} (@{username})")
+            content = [] # Initialiser comme liste vide si aucun contenu
+        
+        # Log du nombre de posts bruts collectés
+        logger.debug(f"Threads: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        
+        # Préparer les résultats
+        results = {
+            "platform": "threads",
+            "username": username,
+            "posts": content
+        }
+        
+        # Traiter le contenu extrait
+        model_names = [model["name"]]
+        count = process_scraped_content(results, model_names)
+        
+        logger.info(f"Scraping Threads terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        
+        # Scraper les comptes similaires (si applicable)
+        # Note: La logique pour les comptes similaires Threads n\"est pas implémentée ici
+        
+        return results
+    except Exception as e:
+        logger.error(f"Erreur lors du scraping Threads pour {model[\'name\']}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
+
+def run_tiktok_scraping(model, days_limit=14, max_posts=20):
+    """
+    Exécute le scraping TikTok pour un modèle donné.
+    
+    Args:
+        model (dict): Informations du modèle
+        days_limit (int): Limite en jours pour le contenu récent
+        max_posts (int): Nombre maximum de posts à extraire
+        
+    Returns:
+        dict: Résultats du scraping
+    """
+    if "tiktok" not in model or not model["tiktok"]:
+        logger.warning(f"Pas de compte TikTok défini pour {model[\'name\']}")
+        return None
+    
+    username = model["tiktok"]
+    logger.info(f"Scraping TikTok pour {model[\'name\']} (@{username})...")
+    
+    try:
+        # Extraire le contenu TikTok
+        content = extract_tiktok_content(username, days_limit, max_posts)
+        
+        if not content:
+            logger.warning(f"Aucun contenu TikTok trouvé pour {model[\'name\']} (@{username})")
+            content = [] # Initialiser comme liste vide si aucun contenu
+        
+        # Log du nombre de posts bruts collectés
+        logger.debug(f"TikTok: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        
+        # Préparer les résultats
+        results = {
+            "platform": "tiktok",
+            "username": username,
+            "posts": content
+        }
+        
+        # Traiter le contenu extrait
+        model_names = [model["name"]]
+        count = process_scraped_content(results, model_names)
+        
+        logger.info(f"Scraping TikTok terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        
+        # Scraper les comptes similaires (si applicable)
+        # Note: La logique pour les comptes similaires TikTok n\"est pas implémentée ici
+        
+        return results
+    except Exception as e:
+        logger.error(f"Erreur lors du scraping TikTok pour {model[\'name\']}: {str(e)}")
+        logger.error(traceback.format_exc())
+        return None
+
+def run_trending_scraping():
+    """Exécute le scraping des tendances."""
+    logger.info("Scraping des tendances...")
+    
+    try:
+        # TikTok
+        tiktok_hashtags = get_tiktok_trending_hashtags()
+        if tiktok_hashtags:
+            process_trending_content({
+                "platform": "tiktok",
+                "content_type": "hashtag",
+                "items": tiktok_hashtags
+            })
+        
+        tiktok_sounds = get_tiktok_trending_sounds()
+        if tiktok_sounds:
+            process_trending_content({
+                "platform": "tiktok",
+                "content_type": "sound",
+                "items": tiktok_sounds
+            })
+        
+        # Ajouter d\"autres plateformes si nécessaire
+        
+        logger.info("Scraping des tendances terminé.")
+    except Exception as e:
+        logger.error(f"Erreur lors du scraping des tendances: {str(e)}")
+        logger.error(traceback.format_exc())
+
+def run_veille_automatisee(test_mode=False):
+    """Exécute le processus complet de veille automatisée."""
+    logger.info("Démarrage de la veille automatisée...")
+    
+    # Configurer l\"environnement
+    if not setup_environment():
         return
     
-    # Exemple de contenu pour chaque modèle (pour test)
-    content_data = {
-        "Talia": {
-            "date": "2025-04-28",
-            "photo_links": [
-                "https://test.com/p/ABC123/",
-                "https://test.com/talia_srz/status/123456789"
-            ],
-            "video_link": "https://test.com/talia_srz/status/987654321",
-            "reel_link": "https://test.com/reel/DEF456/"
-        },
-        "Léa": {
-            "date": "2025-04-28",
-            "photo_links": [
-                "https://test.com/p/GHI789/",
-                "https://test.com/@lea_vlmtt/post/123456"
-            ],
-            "video_link": None,
-            "reel_link": "https://test.com/reel/JKL012/"
-        },
-        "Lizz": {
-            "date": "2025-04-28",
-            "photo_links": [
-                "https://test.com/p/MNO345/"
-            ],
-            "video_link": "https://test.com/@lizz.rmo/post/345678",
-            "reel_link": None
-        }
-    }
+    # Mettre à jour les préférences et statistiques des modèles
+    update_model_preferences()
+    update_model_stats()
     
-    # Mettre à jour le Google Sheet pour tous les modèles
-    logger.info("Test de mise à jour du Google Sheet avec des données d'exemple...")
-    results = integration.update_all_models(content_data)
+    # Si mode test, générer des données de test
+    if test_mode:
+        logger.info("Mode test activé. Génération de données fictives.")
+        if not generate_test_data():
+            logger.error("Échec de la génération des données de test.")
+            # Continuer quand même pour tester la sélection et l\"intégration GSheet
+    else:
+        logger.info("Mode normal activé. Scraping des données réelles.")
+        # Exécuter le scraping pour chaque modèle
+        for model in MODELS:
+            run_instagram_scraping(model)
+            run_twitter_scraping(model)
+            run_threads_scraping(model)
+            run_tiktok_scraping(model)
+        
+        # Exécuter le scraping des tendances
+        run_trending_scraping()
     
-    # Afficher les résultats
-    for model_name, success in results.items():
-        status = "réussie" if success else "échouée"
-        print(f"Mise à jour (test) pour {model_name}: {status}")
+    # Sélectionner le contenu pour tous les modèles
+    model_names = [model["name"] for model in MODELS]
+    selected_content = select_content_for_all_models(model_names)
+    
+    # Mettre à jour le Google Sheet
+    try:
+        gsheet = GoogleSheetIntegration(SPREADSHEET_ID)
+        if gsheet.authenticate():
+            for model_name, content in selected_content.items():
+                gsheet.update_sheet_for_model(model_name, content)
+        else:
+            logger.error("Échec de l\"authentification Google Sheet. Vérifiez le fichier service_account.json.")
+    except Exception as e:
+        logger.error(f"Erreur lors de la mise à jour du Google Sheet: {str(e)}")
+        logger.error(traceback.format_exc())
+    
+    logger.info("Veille automatisée terminée avec succès.")
+
+def main():
+    """Fonction principale du script."""
+    parser = argparse.ArgumentParser(description="Système de veille automatisée pour créatrices OnlyFans.")
+    parser.add_argument("--test", action="store_true", help="Exécute le script en mode test avec des données fictives.")
+    parser.add_argument("--scheduled", action="store_true", help="Exécute le script en mode planifié (une fois par jour).")
+    args = parser.parse_args()
+    
+    if args.scheduled:
+        logger.info("Mode planifié activé. Exécution quotidienne à 02:00.")
+        # Planifier l\"exécution quotidienne
+        schedule.every().day.at("02:00").do(run_veille_automatisee, test_mode=args.test)
+        
+        # Exécuter une première fois immédiatement
+        run_veille_automatisee(test_mode=args.test)
+        
+        # Boucle infinie pour maintenir le planning actif
+        while True:
+            schedule.run_pending()
+            time.sleep(60) # Vérifier toutes les minutes
+    else:
+        # Exécution unique
+        run_veille_automatisee(test_mode=args.test)
 
 if __name__ == "__main__":
-    # Décommenter les lignes suivantes pour générer l'URL OAuth ou échanger un code
-    # print("URL OAuth: ", generate_oauth_url())
-    # auth_code = input("Entrez le code d'autorisation obtenu après redirection (ou l'URL complète): ")
-    # # Extraire le code de l'URL si nécessaire (ex: ?code=4/0Af...&scope=...)
-    # if 'code=' in auth_code:
-    #     import urllib.parse
-    #     parsed_url = urllib.parse.urlparse(auth_code)
-    #     query_params = urllib.parse.parse_qs(parsed_url.query)
-    #     auth_code = query_params.get('code', [None])[0]
-    # if auth_code:
-    #     exchange_auth_code_for_token(auth_code)
-    # else:
-    #     print("Code d'autorisation non trouvé.")
-    
-    # Exécuter le test principal par défaut
     main()
 

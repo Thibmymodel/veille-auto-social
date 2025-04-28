@@ -2,20 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Module d'algorithme de sélection de contenu pour la veille automatisée des créatrices OnlyFans.
-Ce module contient les fonctions nécessaires pour sélectionner le contenu le plus pertinent
-selon les critères spécifiés pour chaque modèle.
+Module pour la sélection de contenu pertinent basé sur l'engagement et les préférences.
 """
 
-import os
-import re
-import json
-import time
-import random
 import sqlite3
 import logging
 import datetime
-from collections import defaultdict
+import json
+import traceback
+from typing import List, Dict, Any, Tuple
 
 # Configuration du logging
 logging.basicConfig(
@@ -28,1000 +23,566 @@ logging.basicConfig(
 )
 logger = logging.getLogger("content_selector")
 
-# Configuration de la base de données SQLite
+# Constantes pour les seuils de sélection (abaissés pour le diagnostic)
+MIN_ENGAGEMENT_SCORE = 0.01  # Seuil minimum de score d'engagement
+MIN_VIEWS = 1              # Seuil minimum de vues pour les vidéos/reels
+PERFORMANCE_THRESHOLD = 0.01 # Seuil de performance par rapport à la moyenne (ex: 1.5 = 50% au-dessus)
+RECENCY_DAYS_LIMIT = 14    # Limite en jours pour considérer un contenu comme récent
+
+# Chemin de la base de données
 DB_PATH = "content_database.db"
 
-# Seuils de sélection (ABAISSÉS POUR DIAGNOSTIC)
-MIN_ENGAGEMENT_SCORE = 0.01  # Valeur originale probablement plus élevée
-MIN_VIEWS = 1  # Valeur originale probablement plus élevée
-PERFORMANCE_THRESHOLD = 0.01  # Valeur originale probablement plus élevée
-
 class ContentSelector:
-    """Classe pour la sélection de contenu selon les critères spécifiés."""
+    """Classe pour gérer la base de données et la sélection de contenu."""
     
-    def __init__(self):
-        """Initialise le sélecteur de contenu."""
-        self.conn = sqlite3.connect(DB_PATH)
-        self.cursor = self.conn.cursor()
-        self._ensure_database_structure()
-        logger.info(f"ContentSelector initialisé avec seuils bas: MIN_ENGAGEMENT_SCORE={MIN_ENGAGEMENT_SCORE}, MIN_VIEWS={MIN_VIEWS}, PERFORMANCE_THRESHOLD={PERFORMANCE_THRESHOLD}")
-    
-    def _ensure_database_structure(self):
-        """Assure que la structure de la base de données est correcte."""
-        # Créer la table extracted_links si elle n'existe pas
-        self.cursor.execute('''
-        CREATE TABLE IF NOT EXISTS extracted_links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_name TEXT NOT NULL,
-            link TEXT NOT NULL,
-            content_type TEXT NOT NULL,
-            platform TEXT NOT NULL,
-            extraction_date TEXT NOT NULL,
-            performance_metric REAL DEFAULT 0,
-            engagement_score REAL DEFAULT 0,
-            is_speaking INTEGER DEFAULT 0,
-            has_captions INTEGER DEFAULT 0,
-            has_music INTEGER DEFAULT 0,
-            is_used INTEGER DEFAULT 0,
-            metadata TEXT,
-            UNIQUE(model_name, link)
-        )
-        ''')
-        
-        # Créer la table model_stats si elle n'existe pas
-        self.cursor.execute('''
-        CREATE TABLE IF NOT EXISTS model_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_name TEXT UNIQUE NOT NULL,
-            avg_reel_views REAL DEFAULT 0,
-            avg_video_views REAL DEFAULT 0,
-            avg_photo_likes REAL DEFAULT 0,
-            avg_engagement_rate REAL DEFAULT 0,
-            last_updated TEXT NOT NULL
-        )
-        ''')
-        
-        # Créer la table model_preferences si elle n'existe pas
-        self.cursor.execute('''
-        CREATE TABLE IF NOT EXISTS model_preferences (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            model_name TEXT UNIQUE NOT NULL,
-            prefers_speaking INTEGER DEFAULT 0,
-            prefers_captions INTEGER DEFAULT 0,
-            prefers_music INTEGER DEFAULT 0,
-            preferred_platforms TEXT DEFAULT 'instagram,twitter,threads,tiktok',
-            content_quota TEXT DEFAULT '{"photos": 2, "videos": 1, "reels": 1}'
-        )
-        ''')
-        
-        # Créer la table trending_content si elle n'existe pas
-        self.cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trending_content (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            platform TEXT NOT NULL,
-            content_type TEXT NOT NULL,
-            name TEXT NOT NULL,
-            url TEXT NOT NULL,
-            rank INTEGER NOT NULL,
-            extraction_date TEXT NOT NULL,
-            metadata TEXT,
-            UNIQUE(platform, content_type, name, extraction_date)
-        )
-        ''')
-        
-        self.conn.commit()
-        
-        # Insérer les préférences par défaut pour les modèles si elles n'existent pas
-        default_preferences = [
-            ("Talia", 0, 0, 1, "instagram,twitter,threads,tiktok", '{"photos": 2, "videos": 1, "reels": 1}'),
-            ("Léa", 0, 0, 1, "instagram,twitter,threads,tiktok", '{"photos": 2, "videos": 1, "reels": 1}'),
-            ("Lizz", 1, 1, 0, "instagram,twitter,threads,tiktok", '{"photos": 2, "videos": 1, "reels": 1}')
-        ]
-        
-        for pref in default_preferences:
+    def __init__(self, db_path=DB_PATH):
+        """Initialise la connexion à la base de données et crée les tables si nécessaire."""
+        try:
+            self.conn = sqlite3.connect(db_path)
+            self.cursor = self.conn.cursor()
+            self._create_tables()
+            logger.info(f"Connecté à la base de données: {db_path}")
+        except sqlite3.Error as e:
+            logger.error(f"Erreur de connexion à la base de données: {e}")
+            raise
+
+    def _create_tables(self):
+        """Crée les tables nécessaires dans la base de données si elles n'existent pas."""
+        try:
+            # Table pour stocker le contenu extrait
             self.cursor.execute('''
-            INSERT OR IGNORE INTO model_preferences 
-            (model_name, prefers_speaking, prefers_captions, prefers_music, preferred_platforms, content_quota)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''', pref)
-        
-        # Insérer les statistiques par défaut pour les modèles si elles n'existent pas
-        default_stats = [
-            ("Talia", 4000, 3000, 500, 3.5, datetime.datetime.now().isoformat()),
-            ("Léa", 3000, 2000, 400, 2.8, datetime.datetime.now().isoformat()),
-            ("Lizz", 3500, 2500, 450, 3.2, datetime.datetime.now().isoformat())
-        ]
-        
-        for stat in default_stats:
+            CREATE TABLE IF NOT EXISTS content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_name TEXT NOT NULL,
+                link TEXT UNIQUE NOT NULL,
+                content_type TEXT NOT NULL, -- 'photo', 'video', 'reel', 'tweet', 'thread', 'tiktok'
+                platform TEXT NOT NULL, -- 'instagram', 'twitter', 'threads', 'tiktok'
+                extraction_date TEXT NOT NULL,
+                performance_metric REAL, -- Vues, Likes, etc.
+                engagement_score REAL, -- Score calculé
+                is_speaking INTEGER, -- 0 ou 1
+                has_captions INTEGER, -- 0 ou 1
+                has_music INTEGER, -- 0 ou 1
+                metadata TEXT, -- JSON pour infos supplémentaires (hashtags, sons, etc.)
+                selected INTEGER DEFAULT 0, -- 0: non sélectionné, 1: sélectionné
+                selection_date TEXT
+            )
+            ''')
+            
+            # Table pour stocker les préférences des modèles
             self.cursor.execute('''
-            INSERT OR IGNORE INTO model_stats 
-            (model_name, avg_reel_views, avg_video_views, avg_photo_likes, avg_engagement_rate, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ''', stat)
+            CREATE TABLE IF NOT EXISTS model_preferences (
+                model_name TEXT PRIMARY KEY,
+                prefers_speaking INTEGER DEFAULT 0,
+                prefers_captions INTEGER DEFAULT 0,
+                prefers_music INTEGER DEFAULT 0
+            )
+            ''')
+            
+            # Table pour stocker les statistiques des modèles (ex: vues moyennes)
+            self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS model_stats (
+                model_name TEXT PRIMARY KEY,
+                avg_reel_views REAL DEFAULT 0
+            )
+            ''')
+            
+            # Table pour stocker les tendances
+            self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform TEXT NOT NULL,
+                content_type TEXT NOT NULL, -- 'hashtag', 'sound'
+                item TEXT NOT NULL,
+                rank INTEGER,
+                extraction_date TEXT NOT NULL
+            )
+            ''')
+            
+            # Ajouter les modèles aux tables de préférences et statistiques s'ils n'existent pas
+            # (Utilisé principalement pour l'initialisation)
+            from veille_automatisee import MODELS # Import local pour éviter dépendance circulaire
+            for model in MODELS:
+                self.cursor.execute("INSERT OR IGNORE INTO model_preferences (model_name) VALUES (?)", (model['name'],))
+                self.cursor.execute("INSERT OR IGNORE INTO model_stats (model_name) VALUES (?)", (model['name'],))
+            
+            self.conn.commit()
+            logger.debug("Tables de la base de données vérifiées/créées.")
+        except sqlite3.Error as e:
+            logger.error(f"Erreur lors de la création des tables: {e}")
+            self.conn.rollback()
+            raise
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors de l'initialisation des tables: {e}")
+            logger.error(traceback.format_exc())
+            self.conn.rollback()
+            raise
+
+    def store_content(self, content_item: Dict[str, Any]) -> bool:
+        """
+        Stocke un élément de contenu dans la base de données.
         
-        self.conn.commit()
-    
+        Args:
+            content_item (dict): Dictionnaire contenant les informations du contenu.
+                                 Doit inclure 'model_name', 'link', 'content_type', 'platform',
+                                 'extraction_date', et optionnellement d'autres champs.
+                                 
+        Returns:
+            bool: True si l'insertion a réussi, False sinon.
+        """
+        required_keys = ['model_name', 'link', 'content_type', 'platform', 'extraction_date']
+        if not all(key in content_item for key in required_keys):
+            logger.warning(f"Données de contenu incomplètes, ignoré: {content_item.get('link', 'Lien manquant')}")
+            return False
+            
+        link = content_item['link']
+        logger.debug(f"Tentative de stockage du contenu: {link}")
+        
+        try:
+            # Vérifier si le contenu existe déjà
+            self.cursor.execute("SELECT id FROM content WHERE link = ?", (link,))
+            existing = self.cursor.fetchone()
+            
+            if existing:
+                logger.debug(f"Contenu déjà existant, mise à jour: {link}")
+                # Mettre à jour les métriques si nécessaire (exemple)
+                update_query = "UPDATE content SET extraction_date = ?, performance_metric = ?, engagement_score = ? WHERE link = ?"
+                params = (
+                    content_item.get('extraction_date', datetime.datetime.now().isoformat()),
+                    content_item.get('performance_metric'),
+                    content_item.get('engagement_score'),
+                    link
+                )
+                self.cursor.execute(update_query, params)
+            else:
+                logger.debug(f"Nouveau contenu, insertion: {link}")
+                # Insérer le nouveau contenu
+                insert_query = '''
+                INSERT INTO content (
+                    model_name, link, content_type, platform, extraction_date, 
+                    performance_metric, engagement_score, is_speaking, has_captions, 
+                    has_music, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                '''
+                params = (
+                    content_item['model_name'],
+                    link,
+                    content_item['content_type'],
+                    content_item['platform'],
+                    content_item.get('extraction_date', datetime.datetime.now().isoformat()),
+                    content_item.get('performance_metric'),
+                    content_item.get('engagement_score'),
+                    1 if content_item.get('is_speaking') else 0,
+                    1 if content_item.get('has_captions') else 0,
+                    1 if content_item.get('has_music') else 0,
+                    json.dumps(content_item.get('metadata', {}))
+                )
+                self.cursor.execute(insert_query, params)
+                
+            self.conn.commit()
+            logger.debug(f"Contenu stocké/mis à jour avec succès: {link}")
+            return True
+            
+        except sqlite3.IntegrityError:
+            logger.warning(f"Erreur d'intégrité (probablement lien dupliqué non détecté initialement): {link}")
+            self.conn.rollback()
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Erreur SQLite lors du stockage du contenu {link}: {e}")
+            self.conn.rollback()
+            return False
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors du stockage du contenu {link}: {e}")
+            logger.error(traceback.format_exc())
+            self.conn.rollback()
+            return False
+
+    def store_trend(self, trend_item: Dict[str, Any]) -> bool:
+        """
+        Stocke un élément de tendance dans la base de données.
+        
+        Args:
+            trend_item (dict): Dictionnaire contenant les informations de la tendance.
+                               Doit inclure 'platform', 'content_type', 'item', 'extraction_date'.
+                               
+        Returns:
+            bool: True si l'insertion a réussi, False sinon.
+        """
+        required_keys = ['platform', 'content_type', 'item', 'extraction_date']
+        if not all(key in trend_item for key in required_keys):
+            logger.warning(f"Données de tendance incomplètes, ignoré: {trend_item}")
+            return False
+            
+        item = trend_item['item']
+        platform = trend_item['platform']
+        content_type = trend_item['content_type']
+        extraction_date = trend_item.get('extraction_date', datetime.datetime.now().isoformat())
+        rank = trend_item.get('rank')
+        
+        logger.debug(f"Tentative de stockage de la tendance: {platform} - {content_type} - {item}")
+        
+        try:
+            # Vérifier si la tendance existe déjà pour cette date (simpliste, pourrait être amélioré)
+            self.cursor.execute("SELECT id FROM trends WHERE platform = ? AND content_type = ? AND item = ? AND date(extraction_date) = date(?) ", 
+                              (platform, content_type, item, extraction_date))
+            existing = self.cursor.fetchone()
+            
+            if existing:
+                logger.debug(f"Tendance déjà existante pour aujourd'hui: {item}")
+                # Optionnel: Mettre à jour le rang si nécessaire
+                if rank is not None:
+                    self.cursor.execute("UPDATE trends SET rank = ? WHERE id = ?", (rank, existing[0]))
+            else:
+                logger.debug(f"Nouvelle tendance, insertion: {item}")
+                insert_query = '''
+                INSERT INTO trends (platform, content_type, item, rank, extraction_date)
+                VALUES (?, ?, ?, ?, ?)
+                '''
+                params = (platform, content_type, item, rank, extraction_date)
+                self.cursor.execute(insert_query, params)
+                
+            self.conn.commit()
+            logger.debug(f"Tendance stockée/mise à jour avec succès: {item}")
+            return True
+            
+        except sqlite3.Error as e:
+            logger.error(f"Erreur SQLite lors du stockage de la tendance {item}: {e}")
+            self.conn.rollback()
+            return False
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors du stockage de la tendance {item}: {e}")
+            logger.error(traceback.format_exc())
+            self.conn.rollback()
+            return False
+
+    def _get_model_preferences(self, model_name: str) -> Dict[str, bool]:
+        """Récupère les préférences d'un modèle depuis la base de données."""
+        try:
+            self.cursor.execute("SELECT prefers_speaking, prefers_captions, prefers_music FROM model_preferences WHERE model_name = ?", (model_name,))
+            result = self.cursor.fetchone()
+            if result:
+                return {
+                    "prefers_speaking": bool(result[0]),
+                    "prefers_captions": bool(result[1]),
+                    "prefers_music": bool(result[2])
+                }
+            else:
+                logger.warning(f"Préférences non trouvées pour le modèle: {model_name}")
+                return {}
+        except sqlite3.Error as e:
+            logger.error(f"Erreur SQLite lors de la récupération des préférences pour {model_name}: {e}")
+            return {}
+
+    def _get_model_stats(self, model_name: str) -> Dict[str, float]:
+        """Récupère les statistiques d'un modèle depuis la base de données."""
+        try:
+            self.cursor.execute("SELECT avg_reel_views FROM model_stats WHERE model_name = ?", (model_name,))
+            result = self.cursor.fetchone()
+            if result:
+                return {"avg_reel_views": result[0] if result[0] is not None else 0}
+            else:
+                logger.warning(f"Statistiques non trouvées pour le modèle: {model_name}")
+                return {"avg_reel_views": 0}
+        except sqlite3.Error as e:
+            logger.error(f"Erreur SQLite lors de la récupération des statistiques pour {model_name}: {e}")
+            return {"avg_reel_views": 0}
+
+    def select_content_for_model(self, model_name: str) -> List[Dict[str, Any]]:
+        """
+        Sélectionne le contenu pertinent pour un modèle spécifique.
+        
+        Args:
+            model_name (str): Nom du modèle.
+            
+        Returns:
+            list: Liste des dictionnaires de contenu sélectionné.
+        """
+        logger.info(f"Sélection du contenu pour le modèle: {model_name}")
+        
+        preferences = self._get_model_preferences(model_name)
+        stats = self._get_model_stats(model_name)
+        avg_reel_views = stats.get("avg_reel_views", 0)
+        
+        selected_content = []
+        cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=RECENCY_DAYS_LIMIT)).isoformat()
+        
+        try:
+            # Récupérer le contenu non sélectionné et récent pour ce modèle
+            query = '''
+            SELECT id, link, content_type, platform, performance_metric, engagement_score, 
+                   is_speaking, has_captions, has_music, metadata
+            FROM content 
+            WHERE model_name = ? AND selected = 0 AND extraction_date >= ?
+            '''
+            self.cursor.execute(query, (model_name, cutoff_date))
+            potential_content = self.cursor.fetchall()
+            
+            logger.debug(f"{len(potential_content)} éléments de contenu potentiels trouvés pour {model_name}")
+            
+            for item in potential_content:
+                content_id, link, content_type, platform, performance, score, is_speaking, has_captions, has_music, metadata_json = item
+                metadata = json.loads(metadata_json) if metadata_json else {}
+                
+                logger.debug(f"Évaluation du contenu: {link} (Type: {content_type}, Score: {score}, Perf: {performance})")
+                
+                # 1. Vérifier le score d'engagement minimum
+                if score is None or score < MIN_ENGAGEMENT_SCORE:
+                    logger.debug(f"  Rejeté: Score d'engagement ({score}) < {MIN_ENGAGEMENT_SCORE}")
+                    continue
+                    
+                # 2. Vérifier les vues minimales pour vidéos/reels
+                if content_type in ['video', 'reel'] and (performance is None or performance < MIN_VIEWS):
+                    logger.debug(f"  Rejeté: Vues ({performance}) < {MIN_VIEWS}")
+                    continue
+                    
+                # 3. Vérifier la performance relative pour les reels (si applicable)
+                if content_type == 'reel' and avg_reel_views > 0 and performance is not None:
+                    relative_performance = performance / avg_reel_views
+                    if relative_performance < PERFORMANCE_THRESHOLD:
+                        logger.debug(f"  Rejeté: Performance relative du reel ({relative_performance:.2f}) < {PERFORMANCE_THRESHOLD}")
+                        continue
+                    else:
+                        logger.debug(f"  Performance relative du reel: {relative_performance:.2f} (Seuil: {PERFORMANCE_THRESHOLD})")
+                
+                # 4. Vérifier la correspondance avec les préférences du modèle
+                preference_match = True
+                if preferences:
+                    # Si le modèle préfère parler et que le contenu ne parle pas
+                    if preferences.get('prefers_speaking') and not is_speaking:
+                        preference_match = False
+                        logger.debug("  Rejeté: Le modèle préfère parler, ce contenu ne parle pas.")
+                    # Si le modèle préfère les sous-titres et que le contenu n'en a pas
+                    elif preferences.get('prefers_captions') and not has_captions:
+                        preference_match = False
+                        logger.debug("  Rejeté: Le modèle préfère les sous-titres, ce contenu n'en a pas.")
+                    # Si le modèle préfère la musique et que le contenu n'en a pas
+                    elif preferences.get('prefers_music') and not has_music:
+                        preference_match = False
+                        logger.debug("  Rejeté: Le modèle préfère la musique, ce contenu n'en a pas.")
+                    # Si le modèle NE préfère PAS parler et que le contenu parle
+                    elif not preferences.get('prefers_speaking') and is_speaking:
+                        preference_match = False
+                        logger.debug("  Rejeté: Le modèle ne préfère pas parler, ce contenu parle.")
+                    # Si le modèle NE préfère PAS la musique et que le contenu en a
+                    elif not preferences.get('prefers_music') and has_music:
+                        preference_match = False
+                        logger.debug("  Rejeté: Le modèle ne préfère pas la musique, ce contenu en a.")
+                        
+                if not preference_match:
+                    continue
+                    
+                # Si toutes les conditions sont remplies, sélectionner le contenu
+                logger.info(f"Contenu sélectionné pour {model_name}: {link}")
+                selected_content.append({
+                    "id": content_id,
+                    "link": link,
+                    "content_type": content_type,
+                    "platform": platform,
+                    "performance_metric": performance,
+                    "engagement_score": score,
+                    "is_speaking": bool(is_speaking),
+                    "has_captions": bool(has_captions),
+                    "has_music": bool(has_music),
+                    "metadata": metadata
+                })
+                
+                # Marquer comme sélectionné dans la base de données
+                try:
+                    self.cursor.execute("UPDATE content SET selected = 1, selection_date = ? WHERE id = ?", 
+                                      (datetime.datetime.now().isoformat(), content_id))
+                    self.conn.commit()
+                    logger.debug(f"Contenu marqué comme sélectionné dans la DB: {link}")
+                except sqlite3.Error as e:
+                    logger.error(f"Erreur SQLite lors du marquage du contenu {link} comme sélectionné: {e}")
+                    self.conn.rollback()
+            
+            logger.info(f"{len(selected_content)} éléments sélectionnés pour {model_name}")
+            return selected_content
+            
+        except sqlite3.Error as e:
+            logger.error(f"Erreur SQLite lors de la sélection du contenu pour {model_name}: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Erreur inattendue lors de la sélection du contenu pour {model_name}: {e}")
+            logger.error(traceback.format_exc())
+            return []
+
     def close(self):
         """Ferme la connexion à la base de données."""
         if self.conn:
             self.conn.close()
-    
-    def is_content_already_used(self, model_name, link):
-        """Vérifie si un contenu a déjà été utilisé pour un modèle donné."""
-        self.cursor.execute(
-            "SELECT is_used FROM extracted_links WHERE model_name = ? AND link = ?",
-            (model_name, link)
-        )
-        result = self.cursor.fetchone()
-        
-        if result:
-            return bool(result[0])
-        return False
-    
-    def mark_content_as_used(self, model_name, link):
-        """Marque un contenu comme utilisé dans la base de données."""
-        try:
-            self.cursor.execute(
-                "UPDATE extracted_links SET is_used = 1 WHERE model_name = ? AND link = ?",
-                (model_name, link)
-            )
-            self.conn.commit()
-            logger.info(f"Contenu marqué comme utilisé pour {model_name}: {link}")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors du marquage du contenu comme utilisé: {str(e)}")
-            return False
-    
-    def store_content(self, content_data):
-        """
-        Stocke le contenu extrait dans la base de données.
-        
-        Args:
-            content_data (dict): Données du contenu à stocker
-                {
-                    "model_name": str,
-                    "link": str,
-                    "content_type": str (photo, video, reel),
-                    "platform": str (instagram, twitter, threads, tiktok),
-                    "extraction_date": str (format ISO),
-                    "performance_metric": float,
-                    "engagement_score": float,
-                    "is_speaking": bool,
-                    "has_captions": bool,
-                    "has_music": bool,
-                    "metadata": dict (données supplémentaires en JSON)
-                }
-                
-        Returns:
-            bool: True si le stockage a réussi, False sinon
-        """
-        try:
-            # Convertir les booléens en entiers pour SQLite
-            is_speaking = 1 if content_data.get("is_speaking", False) else 0
-            has_captions = 1 if content_data.get("has_captions", False) else 0
-            has_music = 1 if content_data.get("has_music", False) else 0
-            
-            # Convertir les métadonnées en JSON
-            metadata = json.dumps(content_data.get("metadata", {}))
-            
-            # Insérer ou mettre à jour le contenu
-            self.cursor.execute('''
-            INSERT OR REPLACE INTO extracted_links 
-            (model_name, link, content_type, platform, extraction_date, performance_metric, 
-             engagement_score, is_speaking, has_captions, has_music, is_used, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
-            ''', (
-                content_data["model_name"],
-                content_data["link"],
-                content_data["content_type"],
-                content_data["platform"],
-                content_data.get("extraction_date", datetime.datetime.now().isoformat()),
-                content_data.get("performance_metric", 0),
-                content_data.get("engagement_score", 0),
-                is_speaking,
-                has_captions,
-                has_music,
-                metadata
-            ))
-            
-            self.conn.commit()
-            logger.info(f"Contenu stocké pour {content_data['model_name']}: {content_data['link']} (type: {content_data['content_type']}, plateforme: {content_data['platform']})")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors du stockage du contenu: {str(e)}")
-            return False
-    
-    def store_trending_content(self, trending_data):
-        """
-        Stocke les contenus tendance dans la base de données.
-        
-        Args:
-            trending_data (dict): Données des contenus tendance
-                {
-                    "platform": str (instagram, twitter, threads, tiktok),
-                    "content_type": str (hashtag, sound, challenge, etc.),
-                    "items": [
-                        {
-                            "name": str,
-                            "url": str,
-                            "rank": int,
-                            "metadata": dict (données supplémentaires)
-                        },
-                        ...
-                    ]
-                }
-                
-        Returns:
-            bool: True si le stockage a réussi, False sinon
-        """
-        try:
-            extraction_date = datetime.datetime.now().isoformat()
-            platform = trending_data["platform"]
-            content_type = trending_data["content_type"]
-            
-            for item in trending_data["items"]:
-                metadata = json.dumps(item.get("metadata", {}))
-                
-                self.cursor.execute('''
-                INSERT OR REPLACE INTO trending_content 
-                (platform, content_type, name, url, rank, extraction_date, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    platform,
-                    content_type,
-                    item["name"],
-                    item["url"],
-                    item["rank"],
-                    extraction_date,
-                    metadata
-                ))
-            
-            self.conn.commit()
-            logger.info(f"Contenus tendance stockés pour {platform} ({content_type}): {len(trending_data['items'])} éléments")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors du stockage des contenus tendance: {str(e)}")
-            return False
-    
-    def update_model_stats(self, model_name, stats_data):
-        """
-        Met à jour les statistiques d'un modèle.
-        
-        Args:
-            model_name (str): Nom du modèle
-            stats_data (dict): Données des statistiques
-                {
-                    "avg_reel_views": float,
-                    "avg_video_views": float,
-                    "avg_photo_likes": float,
-                    "avg_engagement_rate": float
-                }
-                
-        Returns:
-            bool: True si la mise à jour a réussi, False sinon
-        """
-        try:
-            self.cursor.execute('''
-            UPDATE model_stats SET 
-            avg_reel_views = ?,
-            avg_video_views = ?,
-            avg_photo_likes = ?,
-            avg_engagement_rate = ?,
-            last_updated = ?
-            WHERE model_name = ?
-            ''', (
-                stats_data.get("avg_reel_views", 0),
-                stats_data.get("avg_video_views", 0),
-                stats_data.get("avg_photo_likes", 0),
-                stats_data.get("avg_engagement_rate", 0),
-                datetime.datetime.now().isoformat(),
-                model_name
-            ))
-            
-            self.conn.commit()
-            logger.info(f"Statistiques mises à jour pour {model_name}")
-            return True
-        except Exception as e:
-            logger.error(f"Erreur lors de la mise à jour des statistiques: {str(e)}")
-            return False
-    
-    def get_model_preferences(self, model_name):
-        """
-        Récupère les préférences d'un modèle.
-        
-        Args:
-            model_name (str): Nom du modèle
-            
-        Returns:
-            dict: Préférences du modèle
-        """
-        self.cursor.execute(
-            """
-            SELECT prefers_speaking, prefers_captions, prefers_music, 
-                   preferred_platforms, content_quota
-            FROM model_preferences 
-            WHERE model_name = ?
-            """,
-            (model_name,)
-        )
-        
-        result = self.cursor.fetchone()
-        
-        if result:
-            return {
-                "prefers_speaking": bool(result[0]),
-                "prefers_captions": bool(result[1]),
-                "prefers_music": bool(result[2]),
-                "preferred_platforms": result[3].split(","),
-                "content_quota": json.loads(result[4])
-            }
-        else:
-            # Valeurs par défaut
-            return {
-                "prefers_speaking": False,
-                "prefers_captions": False,
-                "prefers_music": False,
-                "preferred_platforms": ["instagram", "twitter", "threads", "tiktok"],
-                "content_quota": {"photos": 2, "videos": 1, "reels": 1}
-            }
-    
-    def get_recent_photos(self, model_name, days_threshold=7, count=2, platforms=None):
-        """
-        Récupère les photos récentes pour un modèle donné.
-        
-        Args:
-            model_name (str): Nom du modèle
-            days_threshold (int): Nombre de jours maximum pour considérer une photo comme récente
-            count (int): Nombre de photos à récupérer
-            platforms (list): Liste des plateformes à considérer
-            
-        Returns:
-            list: Liste des liens de photos récentes
-        """
-        # Calculer la date limite
-        cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=days_threshold)).isoformat()
-        
-        # Vérifier le nombre total de photos disponibles pour ce modèle (pour diagnostic)
-        self.cursor.execute(
-            "SELECT COUNT(*) FROM extracted_links WHERE model_name = ? AND content_type = 'photo'",
-            (model_name,)
-        )
-        total_photos = self.cursor.fetchone()[0]
-        logger.debug(f"Total des photos disponibles pour {model_name}: {total_photos}")
-        
-        # Construire la requête en fonction des plateformes
-        query = """
-            SELECT link, platform, engagement_score FROM extracted_links 
-            WHERE model_name = ? 
-            AND content_type = 'photo' 
-            AND extraction_date > ? 
-            AND is_used = 0
-        """
-        
-        params = [model_name, cutoff_date]
-        
-        if platforms:
-            placeholders = ','.join(['?'] * len(platforms))
-            query += f" AND platform IN ({placeholders})"
-            params.extend(platforms)
-        
-        query += " ORDER BY engagement_score DESC, extraction_date DESC LIMIT ?"
-        params.append(count)
-        
-        # Récupérer les photos récentes non utilisées
-        self.cursor.execute(query, params)
-        
-        results = self.cursor.fetchall()
-        photo_links = [{"link": row[0], "platform": row[1], "engagement_score": row[2]} for row in results]
-        
-        logger.info(f"Récupéré {len(photo_links)} photos récentes pour {model_name}")
-        
-        # Si nous n'avons pas assez de photos récentes, compléter avec des photos plus anciennes
-        if len(photo_links) < count:
-            remaining = count - len(photo_links)
-            logger.debug(f"Besoin de {remaining} photos supplémentaires pour {model_name}, recherche de photos plus anciennes")
-            
-            # Construire la requête pour les photos plus anciennes
-            old_query = """
-                SELECT link, platform, engagement_score FROM extracted_links 
-                WHERE model_name = ? 
-                AND content_type = 'photo' 
-                AND is_used = 0
-            """
-            
-            old_params = [model_name]
-            
-            # Exclure les photos déjà sélectionnées
-            if photo_links:
-                excluded_links = [photo["link"] for photo in photo_links]
-                placeholders = ','.join(['?'] * len(excluded_links))
-                old_query += f" AND link NOT IN ({placeholders})"
-                old_params.extend(excluded_links)
-            
-            if platforms:
-                placeholders = ','.join(['?'] * len(platforms))
-                old_query += f" AND platform IN ({placeholders})"
-                old_params.extend(platforms)
-            
-            old_query += " ORDER BY engagement_score DESC, extraction_date DESC LIMIT ?"
-            old_params.append(remaining)
-            
-            self.cursor.execute(old_query, old_params)
-            old_results = self.cursor.fetchall()
-            
-            for row in old_results:
-                photo_links.append({"link": row[0], "platform": row[1], "engagement_score": row[2]})
-            
-            logger.info(f"Ajouté {len(old_results)} photos plus anciennes pour {model_name}")
-        
-        # Afficher les scores d'engagement pour diagnostic
-        for photo in photo_links:
-            logger.debug(f"Photo sélectionnée pour {model_name}: {photo['link']} (score: {photo['engagement_score']})")
-        
-        return photo_links
-    
-    def get_best_video(self, model_name, days_threshold=14, platforms=None):
-        """
-        Récupère la meilleure vidéo pour un modèle donné.
-        
-        Args:
-            model_name (str): Nom du modèle
-            days_threshold (int): Nombre de jours maximum pour considérer une vidéo comme récente
-            platforms (list): Liste des plateformes à considérer
-            
-        Returns:
-            dict: Informations sur la meilleure vidéo
-        """
-        # Calculer la date limite
-        cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=days_threshold)).isoformat()
-        
-        # Vérifier le nombre total de vidéos disponibles pour ce modèle (pour diagnostic)
-        self.cursor.execute(
-            "SELECT COUNT(*) FROM extracted_links WHERE model_name = ? AND content_type = 'video'",
-            (model_name,)
-        )
-        total_videos = self.cursor.fetchone()[0]
-        logger.debug(f"Total des vidéos disponibles pour {model_name}: {total_videos}")
-        
-        # Récupérer les statistiques du modèle
-        self.cursor.execute(
-            "SELECT avg_video_views FROM model_stats WHERE model_name = ?",
-            (model_name,)
-        )
-        result = self.cursor.fetchone()
-        avg_views = result[0] if result else 1000  # Valeur par défaut si aucune statistique
-        
-        # Calculer le seuil minimum de vues (abaissé pour diagnostic)
-        min_views = MIN_VIEWS  # Utilise la constante globale abaissée
-        logger.debug(f"Seuil minimum de vues pour {model_name}: {min_views} (moyenne: {avg_views})")
-        
-        # Construire la requête en fonction des plateformes
-        query = """
-            SELECT link, platform, performance_metric, engagement_score, is_speaking, has_captions, has_music, metadata 
-            FROM extracted_links 
-            WHERE model_name = ? 
-            AND content_type = 'video' 
-            AND extraction_date > ? 
-            AND performance_metric >= ?
-            AND is_used = 0
-        """
-        
-        params = [model_name, cutoff_date, min_views]
-        
-        if platforms:
-            placeholders = ','.join(['?'] * len(platforms))
-            query += f" AND platform IN ({placeholders})"
-            params.extend(platforms)
-        
-        query += " ORDER BY performance_metric DESC, engagement_score DESC LIMIT 1"
-        
-        self.cursor.execute(query, params)
-        result = self.cursor.fetchone()
-        
-        # Si aucune vidéo ne dépasse le seuil, prendre la plus performante
-        if not result:
-            logger.debug(f"Aucune vidéo ne dépasse le seuil pour {model_name}, recherche de la plus performante")
-            relaxed_query = """
-                SELECT link, platform, performance_metric, engagement_score, is_speaking, has_captions, has_music, metadata 
-                FROM extracted_links 
-                WHERE model_name = ? 
-                AND content_type = 'video' 
-                AND extraction_date > ? 
-                AND is_used = 0
-            """
-            
-            relaxed_params = [model_name, cutoff_date]
-            
-            if platforms:
-                placeholders = ','.join(['?'] * len(platforms))
-                relaxed_query += f" AND platform IN ({placeholders})"
-                relaxed_params.extend(platforms)
-            
-            relaxed_query += " ORDER BY performance_metric DESC, engagement_score DESC LIMIT 1"
-            
-            self.cursor.execute(relaxed_query, relaxed_params)
-            result = self.cursor.fetchone()
-        
-        # Si toujours aucun résultat, essayer avec une date plus ancienne
-        if not result:
-            logger.debug(f"Aucune vidéo récente pour {model_name}, recherche de vidéos plus anciennes")
-            oldest_query = """
-                SELECT link, platform, performance_metric, engagement_score, is_speaking, has_captions, has_music, metadata 
-                FROM extracted_links 
-                WHERE model_name = ? 
-                AND content_type = 'video' 
-                AND is_used = 0
-            """
-            
-            oldest_params = [model_name]
-            
-            if platforms:
-                placeholders = ','.join(['?'] * len(platforms))
-                oldest_query += f" AND platform IN ({placeholders})"
-                oldest_params.extend(platforms)
-            
-            oldest_query += " ORDER BY performance_metric DESC, engagement_score DESC LIMIT 1"
-            
-            self.cursor.execute(oldest_query, oldest_params)
-            result = self.cursor.fetchone()
-        
-        if result:
-            metadata = json.loads(result[7]) if result[7] else {}
-            video_info = {
-                "link": result[0],
-                "platform": result[1],
-                "performance_metric": result[2],
-                "engagement_score": result[3],
-                "is_speaking": bool(result[4]),
-                "has_captions": bool(result[5]),
-                "has_music": bool(result[6]),
-                "metadata": metadata
-            }
-            logger.info(f"Vidéo performante trouvée pour {model_name}: {result[0]} ({result[1]}, vues: {result[2]})")
-            return video_info
-        else:
-            logger.warning(f"Aucune vidéo trouvée pour {model_name}")
-            return None
-    
-    def get_best_reel(self, model_name, days_threshold=14, platforms=None):
-        """
-        Récupère le meilleur réel pour un modèle donné.
-        
-        Args:
-            model_name (str): Nom du modèle
-            days_threshold (int): Nombre de jours maximum pour considérer un réel comme récent
-            platforms (list): Liste des plateformes à considérer
-            
-        Returns:
-            dict: Informations sur le meilleur réel
-        """
-        # Calculer la date limite
-        cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=days_threshold)).isoformat()
-        
-        # Vérifier le nombre total de réels disponibles pour ce modèle (pour diagnostic)
-        self.cursor.execute(
-            "SELECT COUNT(*) FROM extracted_links WHERE model_name = ? AND content_type = 'reel'",
-            (model_name,)
-        )
-        total_reels = self.cursor.fetchone()[0]
-        logger.debug(f"Total des réels disponibles pour {model_name}: {total_reels}")
-        
-        # Récupérer les statistiques du modèle
-        self.cursor.execute(
-            "SELECT avg_reel_views FROM model_stats WHERE model_name = ?",
-            (model_name,)
-        )
-        result = self.cursor.fetchone()
-        avg_views = result[0] if result else 3000  # Valeur par défaut si aucune statistique
-        
-        # Calculer le seuil minimum de vues (abaissé pour diagnostic)
-        performance_threshold = PERFORMANCE_THRESHOLD  # Utilise la constante globale abaissée
-        min_views = avg_views * performance_threshold
-        logger.debug(f"Seuil minimum de vues pour réels de {model_name}: {min_views} (moyenne: {avg_views}, seuil: {performance_threshold})")
-        
-        # Construire la requête en fonction des plateformes
-        query = """
-            SELECT link, platform, performance_metric, engagement_score, is_speaking, has_captions, has_music, metadata 
-            FROM extracted_links 
-            WHERE model_name = ? 
-            AND content_type = 'reel' 
-            AND extraction_date > ? 
-            AND performance_metric >= ?
-            AND is_used = 0
-        """
-        
-        params = [model_name, cutoff_date, min_views]
-        
-        if platforms:
-            placeholders = ','.join(['?'] * len(platforms))
-            query += f" AND platform IN ({placeholders})"
-            params.extend(platforms)
-        
-        query += " ORDER BY performance_metric DESC, engagement_score DESC LIMIT 1"
-        
-        self.cursor.execute(query, params)
-        result = self.cursor.fetchone()
-        
-        # Si aucun réel ne dépasse le seuil, prendre le plus performant
-        if not result:
-            logger.debug(f"Aucun réel ne dépasse le seuil pour {model_name}, recherche du plus performant")
-            relaxed_query = """
-                SELECT link, platform, performance_metric, engagement_score, is_speaking, has_captions, has_music, metadata 
-                FROM extracted_links 
-                WHERE model_name = ? 
-                AND content_type = 'reel' 
-                AND extraction_date > ? 
-                AND is_used = 0
-            """
-            
-            relaxed_params = [model_name, cutoff_date]
-            
-            if platforms:
-                placeholders = ','.join(['?'] * len(platforms))
-                relaxed_query += f" AND platform IN ({placeholders})"
-                relaxed_params.extend(platforms)
-            
-            relaxed_query += " ORDER BY performance_metric DESC, engagement_score DESC LIMIT 1"
-            
-            self.cursor.execute(relaxed_query, relaxed_params)
-            result = self.cursor.fetchone()
-        
-        # Si toujours aucun résultat, essayer avec une date plus ancienne
-        if not result:
-            logger.debug(f"Aucun réel récent pour {model_name}, recherche de réels plus anciens")
-            oldest_query = """
-                SELECT link, platform, performance_metric, engagement_score, is_speaking, has_captions, has_music, metadata 
-                FROM extracted_links 
-                WHERE model_name = ? 
-                AND content_type = 'reel' 
-                AND is_used = 0
-            """
-            
-            oldest_params = [model_name]
-            
-            if platforms:
-                placeholders = ','.join(['?'] * len(platforms))
-                oldest_query += f" AND platform IN ({placeholders})"
-                oldest_params.extend(platforms)
-            
-            oldest_query += " ORDER BY performance_metric DESC, engagement_score DESC LIMIT 1"
-            
-            self.cursor.execute(oldest_query, oldest_params)
-            result = self.cursor.fetchone()
-        
-        if result:
-            metadata = json.loads(result[7]) if result[7] else {}
-            reel_info = {
-                "link": result[0],
-                "platform": result[1],
-                "performance_metric": result[2],
-                "engagement_score": result[3],
-                "is_speaking": bool(result[4]),
-                "has_captions": bool(result[5]),
-                "has_music": bool(result[6]),
-                "metadata": metadata
-            }
-            logger.info(f"Réel performant trouvé pour {model_name}: {result[0]} ({result[1]}, vues: {result[2]})")
-            return reel_info
-        else:
-            logger.warning(f"Aucun réel trouvé pour {model_name}")
-            return None
-    
-    def get_trending_hashtags(self, platform=None, limit=5, max_age_days=1):
-        """
-        Récupère les hashtags tendance récents.
-        
-        Args:
-            platform (str, optional): Plateforme spécifique (si None, toutes les plateformes)
-            limit (int): Nombre maximum de hashtags à récupérer
-            max_age_days (int): Âge maximum des données en jours
-            
-        Returns:
-            list: Liste des hashtags tendance
-        """
-        cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=max_age_days)).isoformat()
-        
-        query = """
-            SELECT platform, name, url, rank, metadata 
-            FROM trending_content 
-            WHERE content_type = 'hashtag' 
-            AND extraction_date > ?
-        """
-        
-        params = [cutoff_date]
-        
-        if platform:
-            query += " AND platform = ?"
-            params.append(platform)
-        
-        query += " ORDER BY rank ASC LIMIT ?"
-        params.append(limit)
-        
-        self.cursor.execute(query, params)
-        results = self.cursor.fetchall()
-        
-        hashtags = []
-        for result in results:
-            metadata = json.loads(result[4]) if result[4] else {}
-            hashtags.append({
-                "platform": result[0],
-                "name": result[1],
-                "url": result[2],
-                "rank": result[3],
-                "metadata": metadata
-            })
-        
-        return hashtags
-    
-    def get_trending_sounds(self, platform=None, limit=5, max_age_days=1):
-        """
-        Récupère les sons tendance récents.
-        
-        Args:
-            platform (str, optional): Plateforme spécifique (si None, toutes les plateformes)
-            limit (int): Nombre maximum de sons à récupérer
-            max_age_days (int): Âge maximum des données en jours
-            
-        Returns:
-            list: Liste des sons tendance
-        """
-        cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=max_age_days)).isoformat()
-        
-        query = """
-            SELECT platform, name, url, rank, metadata 
-            FROM trending_content 
-            WHERE content_type = 'sound' 
-            AND extraction_date > ?
-        """
-        
-        params = [cutoff_date]
-        
-        if platform:
-            query += " AND platform = ?"
-            params.append(platform)
-        
-        query += " ORDER BY rank ASC LIMIT ?"
-        params.append(limit)
-        
-        self.cursor.execute(query, params)
-        results = self.cursor.fetchall()
-        
-        sounds = []
-        for result in results:
-            metadata = json.loads(result[4]) if result[4] else {}
-            sounds.append({
-                "platform": result[0],
-                "name": result[1],
-                "url": result[2],
-                "rank": result[3],
-                "metadata": metadata
-            })
-        
-        return sounds
-    
-    def select_daily_content(self, model_name):
-        """
-        Sélectionne le contenu quotidien pour un modèle donné selon les critères spécifiés.
-        
-        Args:
-            model_name (str): Nom du modèle
-            
-        Returns:
-            dict: Contenu sélectionné (photos, vidéo, réel, tendances)
-        """
-        logger.info(f"Sélection du contenu quotidien pour {model_name}")
-        
-        # Récupérer les préférences du modèle
-        preferences = self.get_model_preferences(model_name)
-        
-        # Déterminer les préférences spécifiques
-        speaking_preference = preferences["prefers_speaking"]
-        has_captions_preference = preferences["prefers_captions"]
-        has_music_preference = preferences["prefers_music"]
-        platforms = preferences["preferred_platforms"]
-        
-        # Récupérer les quotas de contenu
-        content_quota = preferences["content_quota"]
-        photos_count = content_quota.get("photos", 2)
-        
-        # Récupérer les photos récentes
-        photos = self.get_recent_photos(model_name, days_threshold=7, count=photos_count, platforms=platforms)
-        
-        # Récupérer la meilleure vidéo
-        video = self.get_best_video(model_name, days_threshold=14, platforms=platforms)
-        
-        # Récupérer le meilleur réel
-        reel = self.get_best_reel(model_name, days_threshold=14, platforms=platforms)
-        
-        # Récupérer les tendances
-        hashtags = self.get_trending_hashtags(limit=3)
-        sounds = self.get_trending_sounds(limit=3)
-        
-        # Marquer le contenu comme utilisé
-        for photo in photos:
-            self.mark_content_as_used(model_name, photo["link"])
-        
-        if video:
-            self.mark_content_as_used(model_name, video["link"])
-        
-        if reel:
-            self.mark_content_as_used(model_name, reel["link"])
-        
-        # Préparer le résultat
-        result = {
-            "photos": photos,
-            "video": video,
-            "reel": reel,
-            "trending": {
-                "hashtags": hashtags,
-                "sounds": sounds
-            }
-        }
-        
-        logger.info(f"Contenu sélectionné pour {model_name}: {len(photos)} photos, {1 if video else 0} vidéo, {1 if reel else 0} réel")
-        return result
+            logger.info("Connexion à la base de données fermée.")
 
-def select_content_for_all_models(model_names):
+# Fonctions utilitaires pour interagir avec la classe ContentSelector
+
+def process_scraped_content(scraped_data: Dict[str, Any], model_names: List[str]) -> int:
     """
-    Sélectionne le contenu pour tous les modèles spécifiés.
+    Traite les données scrapées et les stocke dans la base de données.
     
     Args:
-        model_names (list): Liste des noms de modèles
+        scraped_data (dict): Données brutes du scraper (doit contenir 'platform', 'username', 'posts').
+        model_names (list): Liste des noms de modèles associés à ces données.
         
     Returns:
-        dict: Contenu sélectionné pour chaque modèle
+        int: Nombre d'éléments de contenu stockés avec succès.
     """
-    selector = ContentSelector()
-    results = {}
-    
-    for model_name in model_names:
-        results[model_name] = selector.select_daily_content(model_name)
-    
-    selector.close()
-    return results
-
-def process_scraped_content(scraped_data, model_names):
-    """
-    Traite le contenu scrapé et le stocke dans la base de données.
-    
-    Args:
-        scraped_data (dict): Données scrapées
-            {
-                "platform": str,
-                "username": str,
-                "posts": [
-                    {
-                        "type": str (photo, video, reel),
-                        "url": str,
-                        "likes": int,
-                        "comments": int,
-                        "views": int,
-                        "is_speaking": bool,
-                        "has_captions": bool,
-                        "has_music": bool,
-                        "date": str,
-                        "metadata": dict
-                    },
-                    ...
-                ]
-            }
-        model_names (list): Liste des noms de modèles associés à ce contenu
-        
-    Returns:
-        int: Nombre d'éléments stockés
-    """
-    if not scraped_data or "posts" not in scraped_data or not scraped_data["posts"]:
-        logger.warning(f"Aucun contenu à traiter pour {scraped_data.get('username', 'inconnu')} sur {scraped_data.get('platform', 'inconnu')}")
+    if not scraped_data or 'posts' not in scraped_data or not scraped_data['posts']:
+        logger.debug("Aucune donnée scrapée à traiter.")
         return 0
-    
-    platform = scraped_data["platform"]
-    username = scraped_data["username"]
-    posts = scraped_data["posts"]
-    
-    logger.info(f"Traitement de {len(posts)} posts pour {username} sur {platform}")
-    
-    selector = ContentSelector()
+        
+    platform = scraped_data.get('platform', 'inconnu')
+    username = scraped_data.get('username', 'inconnu')
+    posts = scraped_data['posts']
     count = 0
     
-    for post in posts:
-        post_type = post.get("type", "photo")
-        content_type = post_type
-        
-        # Convertir le type si nécessaire
-        if post_type == "image":
-            content_type = "photo"
-        elif post_type == "carousel":
-            content_type = "photo"  # Traiter les carrousels comme des photos pour simplifier
-        
-        # Calculer le score d'engagement
-        likes = post.get("likes", 0)
-        comments = post.get("comments", 0)
-        views = post.get("views", 0)
-        
-        engagement_score = 0
-        performance_metric = 0
-        
-        if content_type == "photo":
-            engagement_score = likes + (comments * 2)  # Les commentaires valent plus que les likes
-            performance_metric = likes
-        elif content_type in ["video", "reel"]:
-            engagement_score = likes + (comments * 2)
-            performance_metric = views
-        
-        # Stocker le contenu pour chaque modèle associé
-        for model_name in model_names:
-            content_data = {
-                "model_name": model_name,
-                "link": post["url"],
-                "content_type": content_type,
+    logger.debug(f"Traitement de {len(posts)} posts scrapés de {platform} pour {username} (Modèles: {', '.join(model_names)})")
+    
+    selector = None
+    try:
+        selector = ContentSelector()
+        for post in posts:
+            # Adapter les données du post au format attendu par store_content
+            content_item = {
+                "link": post.get('link'),
+                "content_type": post.get('type', 'inconnu'),
                 "platform": platform,
-                "extraction_date": post.get("date", datetime.datetime.now().isoformat()),
-                "performance_metric": performance_metric,
-                "engagement_score": engagement_score,
-                "is_speaking": post.get("is_speaking", False),
-                "has_captions": post.get("has_captions", False),
-                "has_music": post.get("has_music", False),
-                "metadata": post.get("metadata", {})
+                "extraction_date": post.get('timestamp', datetime.datetime.now().isoformat()),
+                "performance_metric": post.get('views') or post.get('likes'), # Priorité aux vues
+                "engagement_score": post.get('engagement_score'), # Assumer que le scraper le calcule
+                "is_speaking": post.get('is_speaking'),
+                "has_captions": post.get('has_captions'),
+                "has_music": post.get('has_music'),
+                "metadata": post.get('metadata', {})
             }
             
-            if selector.store_content(content_data):
-                count += 1
-    
-    selector.close()
-    logger.info(f"Stocké {count} éléments pour {username} sur {platform}")
+            # Associer à tous les modèles concernés
+            for model_name in model_names:
+                content_item["model_name"] = model_name
+                if selector.store_content(content_item):
+                    count += 1
+                    # On ne compte qu'une fois même si stocké pour plusieurs modèles
+                    # (car store_content gère l'unicité par lien)
+                    break # Sortir de la boucle des modèles une fois stocké
+                    
+    except Exception as e:
+        logger.error(f"Erreur lors du traitement des données scrapées pour {username}: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        if selector:
+            selector.close()
+            
+    logger.debug(f"{count} éléments de contenu traités et potentiellement stockés pour {username}")
     return count
 
-def process_trending_content(trending_data):
+def process_trending_content(trending_data: Dict[str, Any]) -> int:
     """
-    Traite le contenu tendance et le stocke dans la base de données.
+    Traite les données de tendances et les stocke dans la base de données.
     
     Args:
-        trending_data (dict): Données tendance
-            {
-                "platform": str,
-                "content_type": str,
-                "items": [
-                    {
-                        "name": str,
-                        "url": str,
-                        "rank": int,
-                        "metadata": dict
-                    },
-                    ...
-                ]
-            }
+        trending_data (dict): Données brutes des tendances (doit contenir 'platform', 'content_type', 'items').
         
     Returns:
-        bool: True si le traitement a réussi, False sinon
+        int: Nombre d'éléments de tendance stockés avec succès.
     """
-    if not trending_data or "items" not in trending_data or not trending_data["items"]:
-        logger.warning(f"Aucun contenu tendance à traiter pour {trending_data.get('platform', 'inconnu')}")
-        return False
+    if not trending_data or 'items' not in trending_data or not trending_data['items']:
+        logger.debug("Aucune donnée de tendance à traiter.")
+        return 0
+        
+    platform = trending_data.get('platform', 'inconnu')
+    content_type = trending_data.get('content_type', 'inconnu')
+    items = trending_data['items']
+    count = 0
+    now = datetime.datetime.now().isoformat()
     
-    selector = ContentSelector()
-    result = selector.store_trending_content(trending_data)
-    selector.close()
+    logger.debug(f"Traitement de {len(items)} tendances de type '{content_type}' pour {platform}")
     
-    return result
+    selector = None
+    try:
+        selector = ContentSelector()
+        for i, item_data in enumerate(items):
+            # Adapter les données au format attendu par store_trend
+            trend_item = {
+                "platform": platform,
+                "content_type": content_type,
+                "item": item_data.get('name') if isinstance(item_data, dict) else item_data, # Nom du hashtag/son
+                "rank": item_data.get('rank', i + 1) if isinstance(item_data, dict) else i + 1,
+                "extraction_date": now
+            }
+            if selector.store_trend(trend_item):
+                count += 1
+                
+    except Exception as e:
+        logger.error(f"Erreur lors du traitement des données de tendance pour {platform}: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        if selector:
+            selector.close()
+            
+    logger.debug(f"{count} éléments de tendance traités et potentiellement stockés pour {platform}")
+    return count
 
-# Fonction principale pour tester le module
-if __name__ == "__main__":
-    logger.info("Test du module de sélection de contenu")
+def select_content_for_all_models(model_names: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Sélectionne le contenu pertinent pour une liste de modèles.
     
-    # Créer une instance du sélecteur de contenu
-    selector = ContentSelector()
+    Args:
+        model_names (list): Liste des noms de modèles.
+        
+    Returns:
+        dict: Dictionnaire avec les noms de modèles comme clés et les listes de contenu sélectionné comme valeurs.
+    """
+    all_selected_content = {}
+    selector = None
+    try:
+        selector = ContentSelector()
+        for model_name in model_names:
+            selected = selector.select_content_for_model(model_name)
+            all_selected_content[model_name] = selected
+    except Exception as e:
+        logger.error(f"Erreur lors de la sélection du contenu pour tous les modèles: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        if selector:
+            selector.close()
+            
+    return all_selected_content
+
+# Exemple d'utilisation (peut être exécuté pour tester le module)
+if __name__ == '__main__':
+    logger.info("Test du module ContentSelector...")
     
-    # Tester la sélection de contenu pour un modèle
-    model_name = "Talia"
-    content = selector.select_daily_content(model_name)
-    
-    # Afficher le contenu sélectionné
-    logger.info(f"Contenu sélectionné pour {model_name}:")
-    logger.info(f"Photos: {len(content['photos'])}")
-    logger.info(f"Vidéo: {'Oui' if content['video'] else 'Non'}")
-    logger.info(f"Réel: {'Oui' if content['reel'] else 'Non'}")
-    
-    # Fermer la connexion à la base de données
-    selector.close()
-    
-    logger.info("Test terminé")
+    # Initialiser
+    try:
+        selector = ContentSelector()
+        logger.info("Initialisation réussie.")
+        
+        # Exemple de stockage
+        test_item = {
+            "model_name": "TestModel",
+            "link": "https://example.com/testpost123",
+            "content_type": "photo",
+            "platform": "instagram",
+            "extraction_date": datetime.datetime.now().isoformat(),
+            "performance_metric": 1500,
+            "engagement_score": 5.5,
+            "is_speaking": False,
+            "has_captions": True,
+            "has_music": True,
+            "metadata": {"tags": ["test", "example"]}
+        }
+        if selector.store_content(test_item):
+            logger.info("Stockage de l'élément de test réussi.")
+        else:
+            logger.warning("Échec du stockage de l'élément de test.")
+            
+        # Exemple de sélection (nécessite des données et préférences configurées)
+        # selected = selector.select_content_for_model("Talia")
+        # logger.info(f"Contenu sélectionné pour Talia: {len(selected)} éléments")
+        
+        # Fermer la connexion
+        selector.close()
+        
+    except Exception as e:
+        logger.error(f"Erreur lors du test du module ContentSelector: {e}")
+        logger.error(traceback.format_exc())
+

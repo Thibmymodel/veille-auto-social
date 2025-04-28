@@ -31,7 +31,7 @@ from google_sheet_integration import GoogleSheetIntegration
 # Configuration du logging
 logging.basicConfig(
     level=logging.DEBUG,  # Changé de INFO à DEBUG pour plus de détails
-    format=\'%(asctime)s - %(name)s - %(levelname)s - %(message)s\',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler("veille_automatisee.log"),
         logging.StreamHandler()
@@ -151,7 +151,7 @@ def install_dependencies():
             subprocess.check_call([sys.executable, "-m", "pip", "install", dep])
             logger.info(f"Dépendance installée: {dep}")
         except subprocess.CalledProcessError as e:
-            logger.error(f"Erreur lors de l\"installation de {dep}: {str(e)}")
+            logger.error(f"Erreur lors de l'installation de {dep}: {str(e)}")
             return False
     
     logger.info("Toutes les dépendances ont été installées.")
@@ -167,20 +167,20 @@ def init_database():
         logger.info("Base de données initialisée avec succès.")
         return True
     except Exception as e:
-        logger.error(f"Erreur lors de l\"initialisation de la base de données: {str(e)}")
+        logger.error(f"Erreur lors de l'initialisation de la base de données: {str(e)}")
         return False
 
 def setup_environment():
-    """Configure l\"environnement d\"exécution."""
+    """Configure l'environnement d'exécution."""
     # Vérifier et installer les dépendances si nécessaire
     if not check_dependencies():
         if not install_dependencies():
-            logger.error("Impossible d\"installer toutes les dépendances. Arrêt du programme.")
+            logger.error("Impossible d'installer toutes les dépendances. Arrêt du programme.")
             return False
     
     # Initialiser la base de données SQLite
     if not init_database():
-        logger.error("Impossible d\"initialiser la base de données. Arrêt du programme.")
+        logger.error("Impossible d'initialiser la base de données. Arrêt du programme.")
         return False
     
     # Installer ChromeDriver automatiquement
@@ -189,7 +189,7 @@ def setup_environment():
         chromedriver_autoinstaller.install()
         logger.info("ChromeDriver installé automatiquement.")
     except Exception as e:
-        logger.warning(f"Impossible d\"installer ChromeDriver automatiquement: {str(e)}")
+        logger.warning(f"Impossible d'installer ChromeDriver automatiquement: {str(e)}")
         logger.warning("Vous devrez peut-être installer ChromeDriver manuellement.")
     
     logger.info("Environnement configuré avec succès.")
@@ -210,13 +210,13 @@ def update_model_preferences():
             prefers_music = preferences.get("prefers_music", False)
             
             # Mettre à jour les préférences dans la base de données
-            selector.cursor.execute(\'\'\'
+            selector.cursor.execute('''
             UPDATE model_preferences SET 
             prefers_speaking = ?,
             prefers_captions = ?,
             prefers_music = ?
             WHERE model_name = ?
-            \'\'\', (
+            ''', (
                 1 if prefers_speaking else 0,
                 1 if prefers_captions else 0,
                 1 if prefers_music else 0,
@@ -242,11 +242,11 @@ def update_model_stats():
             avg_views = model.get("avg_views", 0)
             
             # Mettre à jour les statistiques dans la base de données
-            selector.cursor.execute(\'\'\'
+            selector.cursor.execute('''
             UPDATE model_stats SET 
             avg_reel_views = ?
             WHERE model_name = ?
-            \'\'\', (avg_views, model_name))
+            ''', (avg_views, model_name))
         
         selector.conn.commit()
         selector.close()
@@ -336,22 +336,22 @@ def run_instagram_scraping(model, days_limit=14, max_posts=20):
         dict: Résultats du scraping
     """
     if "instagram" not in model or not model["instagram"]:
-        logger.warning(f"Pas de compte Instagram défini pour {model[\'name\']}")
+        logger.warning(f"Pas de compte Instagram défini pour {model['name']}")
         return None
     
     username = model["instagram"]
-    logger.info(f"Scraping Instagram pour {model[\'name\']} (@{username})...")
+    logger.info(f"Scraping Instagram pour {model['name']} (@{username})...")
     
     try:
         # Extraire le contenu Instagram du compte principal
         content = extract_instagram_content(username, days_limit, max_posts)
         
         if not content:
-            logger.warning(f"Aucun contenu Instagram trouvé pour {model[\'name\']} (@{username})")
+            logger.warning(f"Aucun contenu Instagram trouvé pour {model['name']} (@{username})")
             content = []
         
         # Log du nombre de posts bruts collectés
-        logger.debug(f"Instagram: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        logger.debug(f"Instagram: {len(content)} posts bruts collectés pour {model['name']} (@{username})")
         
         # Préparer les résultats
         results = {
@@ -364,13 +364,13 @@ def run_instagram_scraping(model, days_limit=14, max_posts=20):
         model_names = [model["name"]]
         count = process_scraped_content(results, model_names)
         
-        logger.info(f"Scraping Instagram terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        logger.info(f"Scraping Instagram terminé pour {model['name']} (@{username}): {count} éléments stockés")
         
         # Scraper les comptes similaires
         similar_accounts = model.get("similar_accounts", {}).get("instagram", [])
         
         if similar_accounts:
-            logger.info(f"Scraping des comptes Instagram similaires pour {model[\'name\']}...")
+            logger.info(f"Scraping des comptes Instagram similaires pour {model['name']}...")
             
             for similar_account in similar_accounts:
                 try:
@@ -410,7 +410,7 @@ def run_instagram_scraping(model, days_limit=14, max_posts=20):
         
         return results
     except Exception as e:
-        logger.error(f"Erreur lors du scraping Instagram pour {model[\'name\']}: {str(e)}")
+        logger.error(f"Erreur lors du scraping Instagram pour {model['name']}: {str(e)}")
         logger.error(traceback.format_exc())
         return None
 
@@ -427,22 +427,22 @@ def run_twitter_scraping(model, days_limit=14, max_posts=20):
         dict: Résultats du scraping
     """
     if "twitter" not in model or not model["twitter"]:
-        logger.warning(f"Pas de compte Twitter défini pour {model[\'name\']}")
+        logger.warning(f"Pas de compte Twitter défini pour {model['name']}")
         return None
     
     username = model["twitter"]
-    logger.info(f"Scraping Twitter pour {model[\'name\']} (@{username})...")
+    logger.info(f"Scraping Twitter pour {model['name']} (@{username})...")
     
     try:
         # Extraire le contenu Twitter
         content = extract_twitter_content(username, days_limit, max_posts)
         
         if not content:
-            logger.warning(f"Aucun contenu Twitter trouvé pour {model[\'name\']} (@{username})")
+            logger.warning(f"Aucun contenu Twitter trouvé pour {model['name']} (@{username})")
             content = [] # Initialiser comme liste vide si aucun contenu
         
         # Log du nombre de posts bruts collectés
-        logger.debug(f"Twitter: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        logger.debug(f"Twitter: {len(content)} posts bruts collectés pour {model['name']} (@{username})")
         
         # Préparer les résultats
         results = {
@@ -455,14 +455,14 @@ def run_twitter_scraping(model, days_limit=14, max_posts=20):
         model_names = [model["name"]]
         count = process_scraped_content(results, model_names)
         
-        logger.info(f"Scraping Twitter terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        logger.info(f"Scraping Twitter terminé pour {model['name']} (@{username}): {count} éléments stockés")
         
         # Scraper les comptes similaires (si applicable)
-        # Note: La logique pour les comptes similaires Twitter n\"est pas implémentée ici
+        # Note: La logique pour les comptes similaires Twitter n'est pas implémentée ici
         
         return results
     except Exception as e:
-        logger.error(f"Erreur lors du scraping Twitter pour {model[\'name\']}: {str(e)}")
+        logger.error(f"Erreur lors du scraping Twitter pour {model['name']}: {str(e)}")
         logger.error(traceback.format_exc())
         return None
 
@@ -479,22 +479,22 @@ def run_threads_scraping(model, days_limit=14, max_posts=20):
         dict: Résultats du scraping
     """
     if "threads" not in model or not model["threads"]:
-        logger.warning(f"Pas de compte Threads défini pour {model[\'name\']}")
+        logger.warning(f"Pas de compte Threads défini pour {model['name']}")
         return None
     
     username = model["threads"]
-    logger.info(f"Scraping Threads pour {model[\'name\']} (@{username})...")
+    logger.info(f"Scraping Threads pour {model['name']} (@{username})...")
     
     try:
         # Extraire le contenu Threads
         content = extract_threads_content(username, days_limit, max_posts)
         
         if not content:
-            logger.warning(f"Aucun contenu Threads trouvé pour {model[\'name\']} (@{username})")
+            logger.warning(f"Aucun contenu Threads trouvé pour {model['name']} (@{username})")
             content = [] # Initialiser comme liste vide si aucun contenu
         
         # Log du nombre de posts bruts collectés
-        logger.debug(f"Threads: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        logger.debug(f"Threads: {len(content)} posts bruts collectés pour {model['name']} (@{username})")
         
         # Préparer les résultats
         results = {
@@ -507,14 +507,14 @@ def run_threads_scraping(model, days_limit=14, max_posts=20):
         model_names = [model["name"]]
         count = process_scraped_content(results, model_names)
         
-        logger.info(f"Scraping Threads terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        logger.info(f"Scraping Threads terminé pour {model['name']} (@{username}): {count} éléments stockés")
         
         # Scraper les comptes similaires (si applicable)
-        # Note: La logique pour les comptes similaires Threads n\"est pas implémentée ici
+        # Note: La logique pour les comptes similaires Threads n'est pas implémentée ici
         
         return results
     except Exception as e:
-        logger.error(f"Erreur lors du scraping Threads pour {model[\'name\']}: {str(e)}")
+        logger.error(f"Erreur lors du scraping Threads pour {model['name']}: {str(e)}")
         logger.error(traceback.format_exc())
         return None
 
@@ -531,22 +531,22 @@ def run_tiktok_scraping(model, days_limit=14, max_posts=20):
         dict: Résultats du scraping
     """
     if "tiktok" not in model or not model["tiktok"]:
-        logger.warning(f"Pas de compte TikTok défini pour {model[\'name\']}")
+        logger.warning(f"Pas de compte TikTok défini pour {model['name']}")
         return None
     
     username = model["tiktok"]
-    logger.info(f"Scraping TikTok pour {model[\'name\']} (@{username})...")
+    logger.info(f"Scraping TikTok pour {model['name']} (@{username})...")
     
     try:
         # Extraire le contenu TikTok
         content = extract_tiktok_content(username, days_limit, max_posts)
         
         if not content:
-            logger.warning(f"Aucun contenu TikTok trouvé pour {model[\'name\']} (@{username})")
+            logger.warning(f"Aucun contenu TikTok trouvé pour {model['name']} (@{username})")
             content = [] # Initialiser comme liste vide si aucun contenu
         
         # Log du nombre de posts bruts collectés
-        logger.debug(f"TikTok: {len(content)} posts bruts collectés pour {model[\'name\']} (@{username})")
+        logger.debug(f"TikTok: {len(content)} posts bruts collectés pour {model['name']} (@{username})")
         
         # Préparer les résultats
         results = {
@@ -559,14 +559,14 @@ def run_tiktok_scraping(model, days_limit=14, max_posts=20):
         model_names = [model["name"]]
         count = process_scraped_content(results, model_names)
         
-        logger.info(f"Scraping TikTok terminé pour {model[\'name\']} (@{username}): {count} éléments stockés")
+        logger.info(f"Scraping TikTok terminé pour {model['name']} (@{username}): {count} éléments stockés")
         
         # Scraper les comptes similaires (si applicable)
-        # Note: La logique pour les comptes similaires TikTok n\"est pas implémentée ici
+        # Note: La logique pour les comptes similaires TikTok n'est pas implémentée ici
         
         return results
     except Exception as e:
-        logger.error(f"Erreur lors du scraping TikTok pour {model[\'name\']}: {str(e)}")
+        logger.error(f"Erreur lors du scraping TikTok pour {model['name']}: {str(e)}")
         logger.error(traceback.format_exc())
         return None
 
@@ -592,7 +592,7 @@ def run_trending_scraping():
                 "items": tiktok_sounds
             })
         
-        # Ajouter d\"autres plateformes si nécessaire
+        # Ajouter d'autres plateformes si nécessaire
         
         logger.info("Scraping des tendances terminé.")
     except Exception as e:
@@ -603,7 +603,7 @@ def run_veille_automatisee(test_mode=False):
     """Exécute le processus complet de veille automatisée."""
     logger.info("Démarrage de la veille automatisée...")
     
-    # Configurer l\"environnement
+    # Configurer l'environnement
     if not setup_environment():
         return
     
@@ -616,7 +616,7 @@ def run_veille_automatisee(test_mode=False):
         logger.info("Mode test activé. Génération de données fictives.")
         if not generate_test_data():
             logger.error("Échec de la génération des données de test.")
-            # Continuer quand même pour tester la sélection et l\"intégration GSheet
+            # Continuer quand même pour tester la sélection et l'intégration GSheet
     else:
         logger.info("Mode normal activé. Scraping des données réelles.")
         # Exécuter le scraping pour chaque modèle
@@ -640,7 +640,7 @@ def run_veille_automatisee(test_mode=False):
             for model_name, content in selected_content.items():
                 gsheet.update_sheet_for_model(model_name, content)
         else:
-            logger.error("Échec de l\"authentification Google Sheet. Vérifiez le fichier service_account.json.")
+            logger.error("Échec de l'authentification Google Sheet. Vérifiez le fichier service_account.json.")
     except Exception as e:
         logger.error(f"Erreur lors de la mise à jour du Google Sheet: {str(e)}")
         logger.error(traceback.format_exc())
@@ -656,7 +656,7 @@ def main():
     
     if args.scheduled:
         logger.info("Mode planifié activé. Exécution quotidienne à 02:00.")
-        # Planifier l\"exécution quotidienne
+        # Planifier l'exécution quotidienne
         schedule.every().day.at("02:00").do(run_veille_automatisee, test_mode=args.test)
         
         # Exécuter une première fois immédiatement
@@ -672,4 +672,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,0 +1,1 @@
+web: python veille_automatisee.py --continuous

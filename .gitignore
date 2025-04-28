@@ -1,0 +1,28 @@
+# Fichiers de credentials Google
+service_account.json
+client_secrets.json
+token.json
+
+# Fichiers Windows Zone Identifier
+*.json.Zone.Identifier
+
+# Cache et fichiers compilés Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Base de données locale SQLite
+content_database.db
+
+# Fichiers journaux (logs)
+*.log
+
+# Dossiers d'environnement virtuel (si utilisés localement)
+venv/
+.venv/
+
+# Fichiers spécifiques à l'OS
+.DS_Store
+Thumbs.db
+
